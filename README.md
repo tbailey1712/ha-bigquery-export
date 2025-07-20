@@ -1,8 +1,8 @@
 # Home Assistant BigQuery Export Integration
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
-[![GitHub Release](https://img.shields.io/github/release/tbailey/ha-bigquery-export.svg)](https://github.com/tbailey/ha-bigquery-export/releases)
-[![License](https://img.shields.io/github/license/tbailey/ha-bigquery-export.svg)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/release/tbailey1712/ha-bigquery-export.svg)](https://github.com/tbailey1712/ha-bigquery-export/releases)
+[![License](https://img.shields.io/github/license/tbailey1712/ha-bigquery-export.svg)](LICENSE)
 
 I had been wanting to be able to analyze more than the 90 days of data that recorder keeps in the local SQL database.  With this plugin, you can export your Home Assistant sensor data to Google BigQuery for long-term storage, analytics, and AI/ML analysis. It defaults to a sensor_data table and brings along all of the attributes.  
 
@@ -371,7 +371,7 @@ This project is licensed under the MIT License.
 ## Support
 
 For issues and questions:
-- [GitHub Issues](https://github.com/yourusername/ha-bigquery-export/issues)
+- [GitHub Issues](https://github.com/tbailey1712/ha-bigquery-export/issues)
 - [Home Assistant Community](https://community.home-assistant.io/)
 
 ## Changelog
