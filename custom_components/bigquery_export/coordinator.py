@@ -152,14 +152,8 @@ class BigQueryExportCoordinator(DataUpdateCoordinator):
             _LOGGER.info("Export status: %s", status)
         
         # Trigger immediate data refresh to update sensor
-        try:
-            self.hass.async_create_task(self.async_refresh())
-        except Exception:
-            # If we can't create a task, try calling it synchronously
-            try:
-                self.hass.add_job(self.async_refresh)
-            except Exception:
-                pass  # Silent fallback
+        # Use add_job instead of async_create_task for thread safety
+        self.hass.add_job(self.async_refresh)
 
     def get_export_statistics(self) -> dict[str, Any]:
         """Get export statistics."""
