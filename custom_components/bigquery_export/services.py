@@ -60,6 +60,37 @@ from .utils import (
 )
 
 
+def compute_time_features(timestamp: datetime) -> dict[str, Any]:
+    """Compute time-based features for ML from a timestamp.
+
+    Args:
+        timestamp: Datetime object to extract features from
+
+    Returns:
+        Dictionary with time-based features
+    """
+    hour = timestamp.hour
+    day_of_week = timestamp.weekday()  # 0=Monday, 6=Sunday
+
+    # Determine time of day
+    if 6 <= hour < 12:
+        time_of_day = "morning"
+    elif 12 <= hour < 17:
+        time_of_day = "afternoon"
+    elif 17 <= hour < 21:
+        time_of_day = "evening"
+    else:
+        time_of_day = "night"
+
+    return {
+        "hour_of_day": hour,
+        "day_of_week": day_of_week,
+        "is_weekend": day_of_week >= 5,  # Saturday=5, Sunday=6
+        "is_night": hour < 6 or hour >= 21,  # 9pm-6am
+        "time_of_day": time_of_day,
+    }
+
+
 def get_entity_metadata(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
     """Get entity metadata from registries (labels, areas).
 
@@ -296,12 +327,12 @@ class BigQueryExportService:
                 # Create table
                 table = bigquery.Table(self._table_ref, schema=schema)
 
-                # Set up partitioning and clustering
+                # Set up partitioning and clustering for unified timeline
                 table.time_partitioning = bigquery.TimePartitioning(
                     type_=bigquery.TimePartitioningType.DAY,
-                    field="last_changed"
+                    field="timestamp"  # Unified timestamp field
                 )
-                table.clustering_fields = ["entity_id", "domain"]
+                table.clustering_fields = ["record_type", "domain", "entity_id"]  # Optimize for record_type queries
 
                 # Create the table
                 created_table = self._client.create_table(table)
@@ -751,6 +782,9 @@ class BigQueryExportService:
                     # Get entity metadata (labels and areas)
                     entity_metadata = get_entity_metadata(self.hass, row.entity_id)
 
+                    # Compute time-based features for ML
+                    time_features = compute_time_features(last_changed) if last_changed else {}
+
                     # Create BigQuery row (convert datetime objects to ISO strings)
                     bq_row = {
                         "entity_id": row.entity_id,
@@ -765,6 +799,12 @@ class BigQueryExportService:
                         "unit_of_measurement": unit_of_measurement,
                         "area_id": entity_metadata["area_id"],
                         "area_name": entity_metadata["area_name"],
+                        # Time features
+                        "hour_of_day": time_features.get("hour_of_day"),
+                        "day_of_week": time_features.get("day_of_week"),
+                        "is_weekend": time_features.get("is_weekend"),
+                        "is_night": time_features.get("is_night"),
+                        "time_of_day": time_features.get("time_of_day"),
                         "export_timestamp": export_timestamp,
                     }
 
@@ -908,6 +948,9 @@ class BigQueryExportService:
                     # Get entity metadata (labels and areas)
                     entity_metadata = get_entity_metadata(self.hass, row.entity_id)
 
+                    # Compute time-based features for ML
+                    time_features = compute_time_features(last_changed) if last_changed else {}
+
                     # Create record for JSONL file
                     # Note: Only include labels field if there are actual labels (BigQuery REPEATED field)
                     record = {
@@ -923,6 +966,12 @@ class BigQueryExportService:
                         "unit_of_measurement": unit_of_measurement,
                         "area_id": entity_metadata["area_id"],
                         "area_name": entity_metadata["area_name"],
+                        # Time features
+                        "hour_of_day": time_features.get("hour_of_day"),
+                        "day_of_week": time_features.get("day_of_week"),
+                        "is_weekend": time_features.get("is_weekend"),
+                        "is_night": time_features.get("is_night"),
+                        "time_of_day": time_features.get("time_of_day"),
                         "export_timestamp": export_timestamp,
                     }
 
@@ -1003,19 +1052,29 @@ class BigQueryExportService:
                   UPDATE SET
                     area_id = source.area_id,
                     area_name = source.area_name,
-                    labels = source.labels
+                    labels = source.labels,
+                    hour_of_day = source.hour_of_day,
+                    day_of_week = source.day_of_week,
+                    is_weekend = source.is_weekend,
+                    is_night = source.is_night,
+                    time_of_day = source.time_of_day
                 WHEN NOT MATCHED THEN
                   INSERT (
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
-                    unit_of_measurement, area_id, area_name, labels, export_timestamp
+                    unit_of_measurement, area_id, area_name, labels,
+                    hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
+                    export_timestamp
                   )
                   VALUES (
                     source.entity_id, source.state, source.attributes,
                     source.last_changed, source.last_updated, source.context_id,
                     source.context_user_id, source.domain, source.friendly_name,
                     source.unit_of_measurement, source.area_id, source.area_name,
-                    source.labels, source.export_timestamp
+                    source.labels,
+                    source.hour_of_day, source.day_of_week, source.is_weekend,
+                    source.is_night, source.time_of_day,
+                    source.export_timestamp
                   )
                 """
                 
@@ -1107,19 +1166,29 @@ class BigQueryExportService:
                   UPDATE SET
                     area_id = source.area_id,
                     area_name = source.area_name,
-                    labels = source.labels
+                    labels = source.labels,
+                    hour_of_day = source.hour_of_day,
+                    day_of_week = source.day_of_week,
+                    is_weekend = source.is_weekend,
+                    is_night = source.is_night,
+                    time_of_day = source.time_of_day
                 WHEN NOT MATCHED THEN
                   INSERT (
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
-                    unit_of_measurement, area_id, area_name, labels, export_timestamp
+                    unit_of_measurement, area_id, area_name, labels,
+                    hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
+                    export_timestamp
                   )
                   VALUES (
                     source.entity_id, source.state, source.attributes,
                     source.last_changed, source.last_updated, source.context_id,
                     source.context_user_id, source.domain, source.friendly_name,
                     source.unit_of_measurement, source.area_id, source.area_name,
-                    source.labels, source.export_timestamp
+                    source.labels,
+                    source.hour_of_day, source.day_of_week, source.is_weekend,
+                    source.is_night, source.time_of_day,
+                    source.export_timestamp
                   )
                 """
                 

@@ -12,6 +12,8 @@ CONF_ENTITIES = "entities"
 CONF_ALLOWED_ENTITIES = "allowed_entities"
 CONF_DENIED_ATTRIBUTES = "denied_attributes"
 CONF_FILTERING_MODE = "filtering_mode"
+CONF_EXPORT_EVENTS = "export_events"
+CONF_EVENT_TYPES = "event_types"
 
 # Filtering modes
 FILTERING_MODE_EXCLUDE = "exclude"  # Export all with exclusions (legacy behavior)
@@ -22,6 +24,20 @@ CONF_LAST_EXPORT_TIME = "last_export_time"
 DEFAULT_EXPORT_SCHEDULE = "weekly"
 DEFAULT_BATCH_SIZE = 1000
 DEFAULT_TABLE_ID = "sensor_data"
+DEFAULT_EXPORT_EVENTS = True
+
+# Event types to export
+EVENT_TYPE_AUTOMATION = "automation_triggered"
+EVENT_TYPE_SCRIPT_STARTED = "script_started"
+EVENT_TYPE_SCENE_ACTIVATED = "scene_activated"
+EVENT_TYPE_STATE_CHANGED = "state_changed"
+EVENT_TYPE_CALL_SERVICE = "call_service"
+
+DEFAULT_EVENT_TYPES = [
+    EVENT_TYPE_AUTOMATION,
+    EVENT_TYPE_SCRIPT_STARTED,
+    EVENT_TYPE_SCENE_ACTIVATED,
+]
 
 # Export schedule options
 EXPORT_SCHEDULES = {
@@ -31,21 +47,46 @@ EXPORT_SCHEDULES = {
     "monthly": 720,
 }
 
-# BigQuery schema fields
+# BigQuery schema fields - Unified Timeline Model
+# Single table for all HA activity: states, automations, scripts, scenes
 BIGQUERY_SCHEMA = [
+    # Core identity
+    {"name": "record_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "timestamp", "type": "TIMESTAMP", "mode": "REQUIRED"},
+    {"name": "record_type", "type": "STRING", "mode": "REQUIRED"},  # state, automation, script, scene
+
+    # Entity info (applies to all records)
     {"name": "entity_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "domain", "type": "STRING", "mode": "NULLABLE"},
+
+    # State-specific fields (NULL for events)
     {"name": "state", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "attributes", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "last_changed", "type": "TIMESTAMP", "mode": "REQUIRED"},
-    {"name": "last_updated", "type": "TIMESTAMP", "mode": "REQUIRED"},
+    {"name": "state_attributes", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "last_updated", "type": "TIMESTAMP", "mode": "NULLABLE"},
+
+    # Event-specific fields (NULL for states)
+    {"name": "event_type", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "event_data", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "triggered_by", "type": "STRING", "mode": "NULLABLE"},
+
+    # Linking (connects related activities)
     {"name": "context_id", "type": "STRING", "mode": "NULLABLE"},
     {"name": "context_user_id", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "domain", "type": "STRING", "mode": "NULLABLE"},
+
+    # Metadata (same for everything)
     {"name": "friendly_name", "type": "STRING", "mode": "NULLABLE"},
     {"name": "unit_of_measurement", "type": "STRING", "mode": "NULLABLE"},
     {"name": "area_id", "type": "STRING", "mode": "NULLABLE"},
     {"name": "area_name", "type": "STRING", "mode": "NULLABLE"},
     {"name": "labels", "type": "STRING", "mode": "REPEATED"},
+
+    # Time-based features (pre-computed for ML)
+    {"name": "hour_of_day", "type": "INTEGER", "mode": "NULLABLE"},
+    {"name": "day_of_week", "type": "INTEGER", "mode": "NULLABLE"},
+    {"name": "is_weekend", "type": "BOOLEAN", "mode": "NULLABLE"},
+    {"name": "is_night", "type": "BOOLEAN", "mode": "NULLABLE"},
+    {"name": "time_of_day", "type": "STRING", "mode": "NULLABLE"},
+
     {"name": "export_timestamp", "type": "TIMESTAMP", "mode": "REQUIRED"},
 ]
 
