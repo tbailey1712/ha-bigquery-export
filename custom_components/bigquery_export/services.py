@@ -311,6 +311,8 @@ class BigQueryExportService:
     async def _ensure_table_exists(self) -> None:
         """Ensure the BigQuery table exists with proper schema."""
         def _create_or_update_table():
+            from google.api_core import exceptions as gcp_exceptions
+
             try:
                 # Check if table exists
                 table = self._client.get_table(self._table_ref)
@@ -336,7 +338,7 @@ class BigQueryExportService:
 
                 return table
 
-            except Exception:
+            except gcp_exceptions.NotFound:
                 # Table doesn't exist, create it
                 _LOGGER.info("Creating table: %s", self._table_ref.table_id)
 
