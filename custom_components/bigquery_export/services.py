@@ -44,6 +44,15 @@ from .const import (
     KEEP_NETWORK_ESSENTIALS,
     EXCLUDE_OTHER_PATTERNS,
     GROW_TENT_ESSENTIALS,
+    CONF_EXPORT_EVENTS,
+    CONF_EVENT_TYPES,
+    DEFAULT_EXPORT_EVENTS,
+    DEFAULT_EVENT_TYPES,
+    EVENT_TYPE_AUTOMATION,
+    EVENT_TYPE_SCRIPT_STARTED,
+    EVENT_TYPE_SCENE_ACTIVATED,
+    EVENT_TYPE_STATE_CHANGED,
+    EVENT_TYPE_CALL_SERVICE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -227,9 +236,156 @@ def should_export_entity_legacy(entity_id: str, domain: str, unit_of_measurement
     # Include all non-network sensors by default
     if not entity_id.startswith('sensor.') or 'network' not in entity_id:
         return True
-        
+
     # Exclude remaining network sensors (the noisy ones)
     return False
+
+
+def parse_event_data(event_type: str, event_data_json: str) -> tuple[str | None, str | None, dict[str, Any]]:
+    """Parse event data JSON to extract entity_id, triggered_by, and clean event data.
+
+    Args:
+        event_type: Type of event (automation_triggered, script_started, etc.)
+        event_data_json: JSON string of event data
+
+    Returns:
+        Tuple of (entity_id, triggered_by, parsed_event_data_dict)
+    """
+    try:
+        if not event_data_json:
+            return None, None, {}
+
+        event_data = json.loads(event_data_json)
+
+        # Extract entity_id based on event type
+        entity_id = None
+        triggered_by = None
+
+        if event_type == EVENT_TYPE_AUTOMATION:
+            # automation_triggered: {"name": "...", "entity_id": "automation.xxx", "source": "..."}
+            entity_id = event_data.get("entity_id")
+            triggered_by = event_data.get("source")
+
+        elif event_type == EVENT_TYPE_SCRIPT_STARTED:
+            # script_started: {"name": "...", "entity_id": "script.xxx"}
+            entity_id = event_data.get("entity_id")
+
+        elif event_type == EVENT_TYPE_SCENE_ACTIVATED:
+            # scene_activated: {"name": "...", "entity_id": "scene.xxx"}
+            entity_id = event_data.get("entity_id")
+
+        elif event_type == EVENT_TYPE_CALL_SERVICE:
+            # call_service: {"domain": "...", "service": "...", "service_data": {...}}
+            # For services, we'll use domain.service as the "entity"
+            domain = event_data.get("domain")
+            service = event_data.get("service")
+            if domain and service:
+                entity_id = f"{domain}.{service}"
+
+        elif event_type == EVENT_TYPE_STATE_CHANGED:
+            # state_changed: {"entity_id": "...", "old_state": {...}, "new_state": {...}}
+            entity_id = event_data.get("entity_id")
+
+        return entity_id, triggered_by, event_data
+
+    except json.JSONDecodeError as err:
+        _LOGGER.warning("Failed to parse event data JSON: %s", err)
+        return None, None, {}
+    except Exception as err:
+        _LOGGER.debug("Error parsing event data: %s", err)
+        return None, None, {}
+
+
+def convert_event_to_timeline_record(
+    event_row,
+    hass: HomeAssistant,
+    export_timestamp: str
+) -> dict[str, Any] | None:
+    """Convert a recorder event row to a unified timeline record.
+
+    Args:
+        event_row: Row from events table
+        hass: Home Assistant instance for metadata lookup
+        export_timestamp: Timestamp of this export operation
+
+    Returns:
+        Dictionary in timeline record format, or None if event should be skipped
+    """
+    try:
+        # Parse event data to extract entity_id
+        entity_id, triggered_by, event_data = parse_event_data(
+            event_row.event_type,
+            event_row.event_data
+        )
+
+        # Skip events without entity_id (can't associate them)
+        if not entity_id:
+            return None
+
+        # Convert time_fired timestamp to datetime
+        time_fired = datetime.fromtimestamp(event_row.time_fired, tz=dt_util.UTC)
+
+        # Extract domain from entity_id
+        domain = entity_id.split(".")[0] if "." in entity_id else None
+
+        # Get entity metadata (labels, areas)
+        entity_metadata = get_entity_metadata(hass, entity_id)
+
+        # Compute time-based features
+        time_features = compute_time_features(time_fired)
+
+        # Generate a unique record_id
+        # Format: event_<event_id>_<timestamp>
+        record_id = f"event_{event_row.event_id}_{int(time_fired.timestamp())}"
+
+        # Create timeline record
+        record = {
+            # Core identity (unified timeline model)
+            "record_id": record_id,
+            "timestamp": time_fired.isoformat(),
+            "record_type": "event",
+
+            # Entity info
+            "entity_id": entity_id,
+            "domain": domain,
+
+            # State-specific fields (NULL for events, but use timestamp for required fields)
+            "state": None,
+            "attributes": None,  # Use attributes instead of state_attributes for consistency
+            "last_updated": time_fired.isoformat(),  # Use event time for required field
+            "last_changed": time_fired.isoformat(),  # Use event time for required field
+
+            # Event-specific fields
+            "event_type": event_row.event_type,
+            "event_data": json.dumps(event_data) if event_data else None,
+            "triggered_by": triggered_by,
+
+            # Context linking
+            "context_id": event_row.context_id,
+            "context_user_id": event_row.context_user_id,
+
+            # Metadata from entity registry
+            "friendly_name": event_data.get("name") if event_data else None,
+            "unit_of_measurement": None,
+            "area_id": entity_metadata.get("area_id"),
+            "area_name": entity_metadata.get("area_name"),
+
+            # Export metadata
+            "export_timestamp": export_timestamp,
+        }
+
+        # Add labels if present
+        if entity_metadata.get("labels"):
+            record["labels"] = entity_metadata["labels"]
+
+        # Add time features
+        record.update(time_features)
+
+        return record
+
+    except Exception as err:
+        _LOGGER.warning("Failed to convert event to timeline record: %s", err)
+        return None
 
 
 class BigQueryExportService:
@@ -243,6 +399,26 @@ class BigQueryExportService:
         self._client: bigquery.Client | None = None
         self._table_ref: bigquery.TableReference | None = None
         self._last_export_count: int = 0
+
+    def _should_export_events(self) -> bool:
+        """Check if events export is enabled in configuration."""
+        # Check options first, then data, default to True
+        if self.entry:
+            return self.entry.options.get(
+                CONF_EXPORT_EVENTS,
+                self.entry.data.get(CONF_EXPORT_EVENTS, DEFAULT_EXPORT_EVENTS)
+            )
+        return self.config.get(CONF_EXPORT_EVENTS, DEFAULT_EXPORT_EVENTS)
+
+    def _get_event_types(self) -> list[str]:
+        """Get configured event types to export."""
+        # Check options first, then data, default to DEFAULT_EVENT_TYPES
+        if self.entry:
+            return self.entry.options.get(
+                CONF_EVENT_TYPES,
+                self.entry.data.get(CONF_EVENT_TYPES, DEFAULT_EVENT_TYPES)
+            )
+        return self.config.get(CONF_EVENT_TYPES, DEFAULT_EVENT_TYPES)
 
     async def async_setup(self) -> None:
         """Set up the BigQuery client."""
@@ -626,23 +802,165 @@ class BigQueryExportService:
         # Run in main thread
         self.hass.add_job(_update)
 
+    async def _query_events(
+        self,
+        start_time: datetime,
+        end_time: datetime,
+        event_types: list[str] | None = None
+    ) -> list:
+        """Query events table from recorder database.
+
+        Args:
+            start_time: Start of time range
+            end_time: End of time range
+            event_types: List of event types to query (defaults to DEFAULT_EVENT_TYPES)
+
+        Returns:
+            List of event rows with event_id, event_type, event_data, time_fired, context_id, context_user_id
+        """
+        if event_types is None:
+            event_types = DEFAULT_EVENT_TYPES
+
+        if not event_types:
+            _LOGGER.debug("No event types configured, skipping events query")
+            return []
+
+        def _query():
+            recorder = get_instance(self.hass)
+            if not recorder:
+                _LOGGER.warning("Recorder not available for events query")
+                return []
+
+            with recorder.get_session() as session:
+                try:
+                    # Convert datetime to Unix timestamps
+                    start_ts = start_time.timestamp()
+                    end_ts = end_time.timestamp()
+
+                    # Build query for events table (modern HA schema with normalized tables)
+                    # Events table schema: event_id, event_type_id, data_id, time_fired_ts, context_id_bin, etc.
+                    query = text("""
+                        SELECT
+                            e.event_id,
+                            et.event_type,
+                            ed.shared_data as event_data,
+                            e.time_fired_ts as time_fired,
+                            LOWER(HEX(e.context_id_bin)) as context_id,
+                            LOWER(HEX(e.context_user_id_bin)) as context_user_id
+                        FROM events e
+                        JOIN event_types et ON e.event_type_id = et.event_type_id
+                        LEFT JOIN event_data ed ON e.data_id = ed.data_id
+                        WHERE e.time_fired_ts >= :start_ts
+                          AND e.time_fired_ts < :end_ts
+                          AND et.event_type IN :event_types
+                        ORDER BY e.time_fired_ts
+                    """)
+
+                    # Debug: Log the query parameters
+                    _LOGGER.info("Events query parameters: start_ts=%s, end_ts=%s, event_types=%s",
+                               start_ts, end_ts, event_types)
+
+                    # First check if any events exist in this time range
+                    count_query = text("""
+                        SELECT COUNT(*) as total, COUNT(DISTINCT et.event_type) as unique_types
+                        FROM events e
+                        JOIN event_types et ON e.event_type_id = et.event_type_id
+                        WHERE e.time_fired_ts >= :start_ts AND e.time_fired_ts < :end_ts
+                    """)
+                    count_result = session.execute(count_query, {"start_ts": start_ts, "end_ts": end_ts})
+                    count_row = count_result.fetchone()
+                    _LOGGER.info("Events in time range: total=%s, unique_types=%s",
+                               count_row.total if count_row else 0,
+                               count_row.unique_types if count_row else 0)
+
+                    # Check what event types exist
+                    types_query = text("""
+                        SELECT et.event_type, COUNT(*) as count
+                        FROM events e
+                        JOIN event_types et ON e.event_type_id = et.event_type_id
+                        WHERE e.time_fired_ts >= :start_ts AND e.time_fired_ts < :end_ts
+                        GROUP BY et.event_type
+                        ORDER BY count DESC
+                        LIMIT 10
+                    """)
+                    types_result = session.execute(types_query, {"start_ts": start_ts, "end_ts": end_ts})
+                    types_rows = types_result.fetchall()
+                    _LOGGER.info("Top event types in range: %s",
+                               [(row.event_type, row.count) for row in types_rows])
+
+                    # Execute main query
+                    result = session.execute(
+                        query,
+                        {
+                            "start_ts": start_ts,
+                            "end_ts": end_ts,
+                            "event_types": tuple(event_types)
+                        }
+                    )
+
+                    rows = result.fetchall()
+                    _LOGGER.info("Queried %d events matching types %s from %s to %s",
+                               len(rows), event_types, start_time, end_time)
+                    return rows
+
+                except Exception as err:
+                    _LOGGER.error("Error querying events: %s", err, exc_info=True)
+                    return []
+
+        return await self.hass.async_add_executor_job(_query)
+
     async def _export_data_range(
         self, start_time: datetime, end_time: datetime, use_bulk_upload: bool = True, status_callback = None
     ) -> int:
-        """Export data for a specific time range."""
+        """Export data for a specific time range.
+
+        This method exports both state changes and events (if enabled) to create a unified timeline.
+        """
         _LOGGER.info("Exporting data range: %s to %s", start_time, end_time)
-        
+
+        # Check if events export is enabled
+        export_events = self._should_export_events()
+        event_types = self._get_event_types() if export_events else []
+
+        if export_events:
+            _LOGGER.info("Events export enabled for types: %s", event_types)
+        else:
+            _LOGGER.info("Events export disabled")
+
         # Get recorder instance
         recorder = get_instance(self.hass)
         if not recorder:
             _LOGGER.error("Recorder not available")
             raise RuntimeError("Recorder not available")
-        
+
+        # Set export timestamp once for consistency
+        export_timestamp = dt_util.utcnow().isoformat()
+
+        # Query events if enabled (do this first, before the executor)
+        event_records = []
+        if export_events and event_types:
+            if status_callback:
+                status_callback("querying", "Querying events...")
+            event_rows = await self._query_events(start_time, end_time, event_types)
+
+            # Convert events to timeline records
+            for event_row in event_rows:
+                event_record = convert_event_to_timeline_record(
+                    event_row,
+                    self.hass,
+                    export_timestamp
+                )
+                if event_record:
+                    event_records.append(event_record)
+
+            _LOGGER.info("Converted %d events to timeline records", len(event_records))
+
         def _query_and_export():
             total_records = 0
-            
-            # Set export timestamp once for this entire export operation
-            export_timestamp = dt_util.utcnow().isoformat()
+
+            # Get event records and export_timestamp from outer scope
+            nonlocal event_records
+            nonlocal export_timestamp
             
             # Store the callback reference for use within the executor
             nonlocal status_callback
@@ -696,7 +1014,7 @@ class BigQueryExportService:
                     
                     if status_callback:
                         status_callback("exporting", f"Creating {estimated_gb:.1f}GB export file for {test_count:,} records...")
-                    return self._bulk_export_via_file(session, start_timestamp, end_timestamp, status_callback)
+                    return self._bulk_export_via_file(session, start_timestamp, end_timestamp, status_callback, event_records, export_timestamp)
                 else:
                     _LOGGER.info("Using batch processing for %d records", test_count)
                     if status_callback:
@@ -851,24 +1169,56 @@ class BigQueryExportService:
                         rows = []
                 
                 _LOGGER.info("Entity filtering: %d rows processed, %d filtered out, %d remaining for export", row_count, filtered_count, row_count - filtered_count)
-                
-                # Insert remaining rows
+
+                # Merge event records with state records
+                if event_records:
+                    _LOGGER.info("Merging %d event records with state records", len(event_records))
+                    # Add event records to the batch
+                    for event_record in event_records:
+                        rows.append(event_record)
+
+                        # Insert batch if we reached the batch size
+                        if len(rows) >= DEFAULT_BATCH_SIZE:
+                            if status_callback:
+                                batch_num = (total_records // DEFAULT_BATCH_SIZE) + 1
+                                status_callback("uploading", f"Uploading batch {batch_num} ({total_records + len(rows):,} records)")
+                            self._insert_batch(rows)
+                            total_records += len(rows)
+                            rows = []
+
+                # Insert remaining rows (both states and events)
                 if rows:
                     self._insert_batch(rows)
                     total_records += len(rows)
-                
-                _LOGGER.info("Export completed with %d total records", total_records)
+
+                _LOGGER.info("Export completed with %d total records (%d states + %d events)",
+                           total_records, row_count - filtered_count, len(event_records))
             return total_records
         
         # Run in executor to avoid blocking
         return await self.hass.async_add_executor_job(_query_and_export)
 
-    def _bulk_export_via_file(self, session, start_timestamp: float, end_timestamp: float, status_callback = None) -> int:
-        """Export large datasets using JSONL file upload to BigQuery with MERGE deduplication."""
-        _LOGGER.info("Starting bulk export via file with MERGE deduplication")
-        
-        # Set export timestamp once for this entire export operation
-        export_timestamp = dt_util.utcnow().isoformat()
+    def _bulk_export_via_file(self, session, start_timestamp: float, end_timestamp: float, status_callback = None, event_records: list = None, export_timestamp: str = None) -> int:
+        """Export large datasets using JSONL file upload to BigQuery with MERGE deduplication.
+
+        Args:
+            session: Database session
+            start_timestamp: Start timestamp
+            end_timestamp: End timestamp
+            status_callback: Optional callback for status updates
+            event_records: Optional list of event records to merge with states
+            export_timestamp: Export timestamp to use (if None, generates new one)
+
+        Returns:
+            Number of records exported
+        """
+        if event_records is None:
+            event_records = []
+
+        if export_timestamp is None:
+            export_timestamp = dt_util.utcnow().isoformat()
+
+        _LOGGER.info("Starting bulk export via file with MERGE deduplication (%d event records)", len(event_records))
         
         temp_file_path = None
         try:
@@ -1011,8 +1361,15 @@ class BigQueryExportService:
                     
                     # Write as JSONL (one JSON object per line)
                     temp_file.write(json.dumps(record) + '\n')
-                
+
                 _LOGGER.info("Entity filtering: %d rows processed, %d filtered out, %d written to file", record_count + filtered_count, filtered_count, record_count)
+
+                # Append event records to the JSONL file
+                if event_records:
+                    _LOGGER.info("Writing %d event records to file", len(event_records))
+                    for event_record in event_records:
+                        temp_file.write(json.dumps(event_record) + '\n')
+                        record_count += 1
             
             # Create temporary table name for bulk import
             temp_table_id = f"temp_bulk_export_{int(dt_util.utcnow().timestamp())}"
@@ -1070,9 +1427,11 @@ class BigQueryExportService:
                 MERGE `{self._table_ref.project}.{self._table_ref.dataset_id}.{self._table_ref.table_id}` AS target
                 USING (
                   SELECT
+                    record_id, timestamp, record_type,
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
                     unit_of_measurement, area_id, area_name, labels,
+                    event_type, event_data, triggered_by,
                     hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
                     month, season, state_changed,
                     export_timestamp
@@ -1083,6 +1442,10 @@ class BigQueryExportService:
                    AND target.last_changed = source.last_changed
                 WHEN MATCHED THEN
                   UPDATE SET
+                    record_type = source.record_type,
+                    event_type = source.event_type,
+                    event_data = source.event_data,
+                    triggered_by = source.triggered_by,
                     area_id = source.area_id,
                     area_name = source.area_name,
                     labels = source.labels,
@@ -1096,19 +1459,23 @@ class BigQueryExportService:
                     state_changed = source.state_changed
                 WHEN NOT MATCHED THEN
                   INSERT (
+                    record_id, timestamp, record_type,
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
                     unit_of_measurement, area_id, area_name, labels,
+                    event_type, event_data, triggered_by,
                     hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
                     month, season, state_changed,
                     export_timestamp
                   )
                   VALUES (
+                    source.record_id, source.timestamp, source.record_type,
                     source.entity_id, source.state, source.attributes,
                     source.last_changed, source.last_updated, source.context_id,
                     source.context_user_id, source.domain, source.friendly_name,
                     source.unit_of_measurement, source.area_id, source.area_name,
                     source.labels,
+                    source.event_type, source.event_data, source.triggered_by,
                     source.hour_of_day, source.day_of_week, source.is_weekend,
                     source.is_night, source.time_of_day,
                     source.month, source.season, source.state_changed,
@@ -1192,9 +1559,11 @@ class BigQueryExportService:
                 MERGE `{self._table_ref.project}.{self._table_ref.dataset_id}.{self._table_ref.table_id}` AS target
                 USING (
                   SELECT
+                    record_id, timestamp, record_type,
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
                     unit_of_measurement, area_id, area_name, labels,
+                    event_type, event_data, triggered_by,
                     hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
                     month, season, state_changed,
                     export_timestamp
@@ -1205,6 +1574,10 @@ class BigQueryExportService:
                    AND target.last_changed = source.last_changed
                 WHEN MATCHED THEN
                   UPDATE SET
+                    record_type = source.record_type,
+                    event_type = source.event_type,
+                    event_data = source.event_data,
+                    triggered_by = source.triggered_by,
                     area_id = source.area_id,
                     area_name = source.area_name,
                     labels = source.labels,
@@ -1218,19 +1591,23 @@ class BigQueryExportService:
                     state_changed = source.state_changed
                 WHEN NOT MATCHED THEN
                   INSERT (
+                    record_id, timestamp, record_type,
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
                     unit_of_measurement, area_id, area_name, labels,
+                    event_type, event_data, triggered_by,
                     hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
                     month, season, state_changed,
                     export_timestamp
                   )
                   VALUES (
+                    source.record_id, source.timestamp, source.record_type,
                     source.entity_id, source.state, source.attributes,
                     source.last_changed, source.last_updated, source.context_id,
                     source.context_user_id, source.domain, source.friendly_name,
                     source.unit_of_measurement, source.area_id, source.area_name,
                     source.labels,
+                    source.event_type, source.event_data, source.triggered_by,
                     source.hour_of_day, source.day_of_week, source.is_weekend,
                     source.is_night, source.time_of_day,
                     source.month, source.season, source.state_changed,

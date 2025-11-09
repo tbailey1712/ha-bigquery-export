@@ -117,29 +117,63 @@ bigquery_service_account: |
 
 **⚠️ Security Note**: While you can paste the JSON directly, using `!secret` references is strongly recommended to keep credentials secure.
 
-### 4. BigQuery Schema
-The integration automatically creates an optimized table with this schema:
+### 4. BigQuery Schema - Unified Timeline Model
+The integration uses a unified timeline model that stores both state changes and events in a single table:
 
 ```sql
 CREATE TABLE `your-project.ha_data.sensor_data` (
+  -- Core identity (unified timeline)
+  record_id STRING,  -- Unique ID: event_<id>_<ts> or state record
+  timestamp TIMESTAMP,  -- Unified timestamp field
+  record_type STRING,  -- 'state' or 'event'
+
+  -- Entity info (applies to all records)
   entity_id STRING NOT NULL,
+  domain STRING,
+
+  -- State-specific fields (NULL for events)
   state STRING,
-  attributes STRING,  -- JSON as string for flexibility
-  last_changed TIMESTAMP NOT NULL,
-  last_updated TIMESTAMP NOT NULL,
+  attributes STRING,  -- JSON as string (state attributes)
+  last_changed TIMESTAMP,
+  last_updated TIMESTAMP,
+
+  -- Event-specific fields (NULL for states)
+  event_type STRING,  -- automation_triggered, script_started, etc.
+  event_data STRING,  -- JSON event data
+  triggered_by STRING,  -- What triggered the event
+
+  -- Context linking (same for both states and events)
   context_id STRING,
   context_user_id STRING,
-  domain STRING,
+
+  -- Metadata from entity registry
   friendly_name STRING,
   unit_of_measurement STRING,
   area_id STRING,  -- Area ID from entity registry
   area_name STRING,  -- Human-readable area name
   labels ARRAY<STRING>,  -- Array of label names from entity registry
+
+  -- Pre-computed time-based features for ML
+  hour_of_day INTEGER,
+  day_of_week INTEGER,  -- 0=Monday, 6=Sunday
+  is_weekend BOOLEAN,
+  is_night BOOLEAN,  -- True if hour < 6 or hour >= 21
+  time_of_day STRING,  -- morning, afternoon, evening, night
+  month INTEGER,
+  season STRING,  -- winter, spring, summer, fall
+  state_changed BOOLEAN,  -- True if state actually changed vs attribute update
+
   export_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
 )
-PARTITION BY DATE(last_changed)
-CLUSTER BY entity_id, domain;
+PARTITION BY DATE(COALESCE(last_changed, timestamp))
+CLUSTER BY entity_id, domain, record_type;
 ```
+
+**New in v1.2.0**:
+- **Unified Timeline Model**: State changes and events (automations, scripts, scenes) in one table
+- **Pre-computed ML Features**: Time-based features calculated at export time for efficient queries
+- **Event Export**: Capture automation triggers, script starts, and scene activations alongside state changes
+- **Context Linking**: Connect events to state changes via `context_id` for cause-and-effect analysis
 
 **New in v1.1.0**: Area and label information is now automatically included with each export, allowing you to filter and analyze by room/location and custom labels.
 
@@ -387,6 +421,87 @@ WHERE 'Important' IN UNNEST(labels)
   AND DATE(last_changed) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
 GROUP BY entity_id, area_name, labels
 ORDER BY state_changes DESC;
+```
+
+### **NEW v1.2.0: Event Analysis**
+```sql
+-- See all automation triggers from last 7 days
+SELECT
+  entity_id,
+  friendly_name,
+  timestamp,
+  triggered_by,
+  area_name
+FROM `project.dataset.sensor_data`
+WHERE record_type = 'event'
+  AND event_type = 'automation_triggered'
+  AND DATE(timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+ORDER BY timestamp DESC;
+```
+
+### **NEW v1.2.0: Cause and Effect Analysis**
+```sql
+-- Find state changes caused by automation triggers using context linking
+SELECT
+  e.timestamp as trigger_time,
+  e.entity_id as automation,
+  e.friendly_name as automation_name,
+  s.entity_id as affected_entity,
+  s.state as new_state,
+  s.last_changed as state_change_time,
+  TIMESTAMP_DIFF(s.last_changed, e.timestamp, SECOND) as delay_seconds
+FROM `project.dataset.sensor_data` e
+JOIN `project.dataset.sensor_data` s
+  ON e.context_id = s.context_id
+WHERE e.record_type = 'event'
+  AND e.event_type = 'automation_triggered'
+  AND s.record_type = 'state'
+  AND DATE(e.timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+ORDER BY e.timestamp DESC, delay_seconds ASC
+LIMIT 100;
+```
+
+### **NEW v1.2.0: Time-Based Pattern Analysis**
+```sql
+-- Analyze automation triggers by time of day and day of week
+SELECT
+  entity_id,
+  time_of_day,
+  CASE day_of_week
+    WHEN 0 THEN 'Monday'
+    WHEN 1 THEN 'Tuesday'
+    WHEN 2 THEN 'Wednesday'
+    WHEN 3 THEN 'Thursday'
+    WHEN 4 THEN 'Friday'
+    WHEN 5 THEN 'Saturday'
+    WHEN 6 THEN 'Sunday'
+  END as day_name,
+  COUNT(*) as trigger_count
+FROM `project.dataset.sensor_data`
+WHERE record_type = 'event'
+  AND event_type = 'automation_triggered'
+  AND DATE(timestamp) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+GROUP BY entity_id, time_of_day, day_of_week
+ORDER BY entity_id, day_of_week, time_of_day;
+```
+
+### **NEW v1.2.0: Unified Timeline View**
+```sql
+-- View both state changes and events in chronological order
+SELECT
+  COALESCE(timestamp, last_changed) as event_time,
+  record_type,
+  entity_id,
+  CASE
+    WHEN record_type = 'state' THEN CONCAT('State: ', state)
+    WHEN record_type = 'event' THEN CONCAT('Event: ', event_type)
+  END as description,
+  area_name,
+  context_id
+FROM `project.dataset.sensor_data`
+WHERE entity_id IN ('automation.morning_routine', 'light.bedroom')
+  AND DATE(COALESCE(timestamp, last_changed)) = CURRENT_DATE()
+ORDER BY event_time DESC;
 ```
 
 ## Troubleshooting
