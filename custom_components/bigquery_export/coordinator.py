@@ -144,16 +144,18 @@ class BigQueryExportCoordinator(DataUpdateCoordinator):
         """Update the current export status and progress."""
         self._current_status = status
         self._current_progress = progress
-        
+
         # Log progress updates at INFO level for visibility
         if progress:
             _LOGGER.info("Export status: %s - %s", status, progress)
         else:
             _LOGGER.info("Export status: %s", status)
-        
+
         # Trigger immediate data refresh to update sensor
-        # Use add_job instead of async_create_task for thread safety
-        self.hass.add_job(self.async_refresh)
+        # Use call_soon_threadsafe for thread safety when called from executor
+        self.hass.loop.call_soon_threadsafe(
+            lambda: self.hass.async_create_task(self.async_refresh())
+        )
 
     def get_export_statistics(self) -> dict[str, Any]:
         """Get export statistics."""

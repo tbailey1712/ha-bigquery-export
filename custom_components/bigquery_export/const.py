@@ -43,6 +43,9 @@ BIGQUERY_SCHEMA = [
     {"name": "domain", "type": "STRING", "mode": "NULLABLE"},
     {"name": "friendly_name", "type": "STRING", "mode": "NULLABLE"},
     {"name": "unit_of_measurement", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "area_id", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "area_name", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "labels", "type": "STRING", "mode": "REPEATED"},
     {"name": "export_timestamp", "type": "TIMESTAMP", "mode": "REQUIRED"},
 ]
 

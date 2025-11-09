@@ -132,11 +132,20 @@ CREATE TABLE `your-project.ha_data.sensor_data` (
   domain STRING,
   friendly_name STRING,
   unit_of_measurement STRING,
+  area_id STRING,  -- Area ID from entity registry
+  area_name STRING,  -- Human-readable area name
+  labels ARRAY<STRING>,  -- Array of label names from entity registry
   export_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP()
 )
 PARTITION BY DATE(last_changed)
 CLUSTER BY entity_id, domain;
 ```
+
+**New in v1.1.0**: Area and label information is now automatically included with each export, allowing you to filter and analyze by room/location and custom labels.
+
+**Smart Inheritance**: If an entity doesn't have explicit labels/areas assigned, the integration automatically falls back to the parent device's labels/areas. This means if you assign labels and an area to a device (e.g., "Awair Family Room"), all its child sensor entities will inherit those labels and areas in the export!
+
+**Backfill Support**: Re-exporting the same time range will automatically update existing records with the latest label/area information. This is perfect for backfilling metadata after you've organized your entities with labels and areas.
 
 ## 🚀 Usage
 
@@ -178,6 +187,30 @@ For first-time setup with lots of historical data:
 
 # Continue with earlier periods...
 ```
+
+### **Backfilling Labels/Areas (v1.1.0+)**
+After upgrading to v1.1.0 and organizing your entities with labels/areas, backfill the metadata:
+
+```yaml
+# Re-export recent data to update with labels/areas
+service: bigquery_export.manual_export
+data:
+  days_back: 90  # Or however far back you want to update
+
+# For older data, export in chunks
+service: bigquery_export.manual_export
+data:
+  start_time: "2025-01-01T00:00:00"
+  end_time: "2025-01-08T00:00:00"
+```
+
+**How it works**: The MERGE operation now includes `WHEN MATCHED` logic that updates `area_id`, `area_name`, and `labels` columns on existing records. This means:
+- ✅ New records get full metadata
+- ✅ Existing records get metadata updated
+- ✅ No duplicate rows created
+- ✅ State/timestamp data remains unchanged
+
+**Schema Migration**: The integration automatically adds the new columns (`area_id`, `area_name`, `labels`) to your existing table on first run. You'll see a log message: `Adding 3 new columns to table: ['area_id', 'area_name', 'labels']`
 
 ### Monitoring
 Track export progress with the built-in sensor:
@@ -284,7 +317,7 @@ WHEN NOT MATCHED THEN INSERT (...)
 
 ### Daily sensor averages
 ```sql
-SELECT 
+SELECT
   DATE(last_changed) as date,
   entity_id,
   AVG(CAST(state AS FLOAT64)) as avg_value
@@ -298,7 +331,7 @@ ORDER BY 1 DESC, 2;
 
 ### Entity activity over time
 ```sql
-SELECT 
+SELECT
   entity_id,
   COUNT(*) as state_changes,
   MIN(last_changed) as first_seen,
@@ -306,6 +339,53 @@ SELECT
 FROM `project.dataset.sensor_data`
 WHERE DATE(last_changed) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
 GROUP BY entity_id
+ORDER BY state_changes DESC;
+```
+
+### **NEW: Query by Area**
+```sql
+-- Average temperature by room/area
+SELECT
+  area_name,
+  AVG(SAFE_CAST(state AS FLOAT64)) as avg_temp,
+  COUNT(*) as measurements
+FROM `project.dataset.sensor_data`
+WHERE domain = 'sensor'
+  AND entity_id LIKE '%temperature%'
+  AND area_name IS NOT NULL
+  AND DATE(last_changed) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+GROUP BY area_name
+ORDER BY avg_temp DESC;
+```
+
+### **NEW: Query by Label**
+```sql
+-- Find all entities with a specific label
+SELECT DISTINCT
+  entity_id,
+  friendly_name,
+  domain,
+  area_name
+FROM `project.dataset.sensor_data`
+WHERE 'HVAC' IN UNNEST(labels)  -- Replace 'HVAC' with your label name
+  AND DATE(last_changed) >= CURRENT_DATE()
+ORDER BY entity_id;
+```
+
+### **NEW: Multi-label Analysis**
+```sql
+-- Analyze entities with multiple labels (e.g., "Important" AND "Energy")
+SELECT
+  entity_id,
+  area_name,
+  labels,
+  COUNT(*) as state_changes,
+  APPROX_QUANTILES(SAFE_CAST(state AS FLOAT64), 4)[OFFSET(2)] as median_value
+FROM `project.dataset.sensor_data`
+WHERE 'Important' IN UNNEST(labels)
+  AND 'Energy' IN UNNEST(labels)
+  AND DATE(last_changed) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+GROUP BY entity_id, area_name, labels
 ORDER BY state_changes DESC;
 ```
 

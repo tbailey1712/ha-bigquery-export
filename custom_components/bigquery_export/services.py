@@ -17,6 +17,9 @@ from sqlalchemy import text
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import label_registry as lr
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -55,6 +58,84 @@ from .utils import (
     sanitize_attributes,
     log_security_event
 )
+
+
+def get_entity_metadata(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
+    """Get entity metadata from registries (labels, areas).
+
+    Falls back to parent device metadata if entity doesn't have explicit values.
+
+    This function is called from the executor thread, so it uses synchronous
+    registry access methods which are thread-safe.
+
+    Args:
+        hass: Home Assistant instance
+        entity_id: The entity ID to look up
+
+    Returns:
+        Dictionary with area_id, area_name, and labels (list of label names)
+    """
+    metadata = {
+        "area_id": None,
+        "area_name": None,
+        "labels": [],
+    }
+
+    try:
+        # Get registries (async_get returns the registry itself synchronously)
+        entity_registry = er.async_get(hass)
+        area_registry = ar.async_get(hass)
+        label_registry = lr.async_get(hass)
+
+        # Import device registry for fallback
+        from homeassistant.helpers import device_registry as dr
+        device_registry = dr.async_get(hass)
+
+        # Look up entity entry (this is a dict lookup, not async)
+        entity_entry = entity_registry.async_get(entity_id)
+
+        if entity_entry:
+            # Get area information (entity first, then device fallback)
+            area_id = entity_entry.area_id
+
+            # If entity doesn't have an area, try to get it from the device
+            if not area_id and entity_entry.device_id:
+                device_entry = device_registry.async_get(entity_entry.device_id)
+                if device_entry and device_entry.area_id:
+                    area_id = device_entry.area_id
+
+            if area_id:
+                metadata["area_id"] = area_id
+                # Get area entry - areas is a dict-like object
+                area_entry = area_registry.areas.get(area_id)
+                if area_entry:
+                    metadata["area_name"] = area_entry.name
+
+            # Get label names (entity first, then device fallback)
+            label_ids = set(entity_entry.labels) if entity_entry.labels else set()
+
+            # If entity doesn't have labels, try to get them from the device
+            if not label_ids and entity_entry.device_id:
+                device_entry = device_registry.async_get(entity_entry.device_id)
+                if device_entry and device_entry.labels:
+                    label_ids = set(device_entry.labels)
+
+            # Resolve label IDs to names - labels is a dict-like object
+            if label_ids:
+                label_names = []
+                for label_id in label_ids:
+                    label_entry = label_registry.labels.get(label_id)
+                    if label_entry and label_entry.name:
+                        # Ensure label name is valid (no control characters, valid UTF-8)
+                        label_name = str(label_entry.name).strip()
+                        if label_name:  # Only add non-empty names
+                            label_names.append(label_name)
+                metadata["labels"] = label_names
+
+    except Exception as err:
+        _LOGGER.debug("Could not get metadata for entity %s: %s", entity_id, err)
+
+    return metadata
 
 
 def should_export_entity_legacy(entity_id: str, domain: str, unit_of_measurement: str = None) -> bool:
@@ -176,39 +257,59 @@ class BigQueryExportService:
 
     async def _ensure_table_exists(self) -> None:
         """Ensure the BigQuery table exists with proper schema."""
-        def _create_table():
+        def _create_or_update_table():
             try:
                 # Check if table exists
                 table = self._client.get_table(self._table_ref)
                 _LOGGER.info("Table exists: %s", table.table_id)
+
+                # Check if we need to add new columns (for schema migration)
+                existing_fields = {field.name for field in table.schema}
+                new_fields_needed = []
+
+                for field_def in BIGQUERY_SCHEMA:
+                    if field_def["name"] not in existing_fields:
+                        new_fields_needed.append(
+                            bigquery.SchemaField(field_def["name"], field_def["type"], field_def["mode"])
+                        )
+
+                # Add missing columns
+                if new_fields_needed:
+                    _LOGGER.info("Adding %d new columns to table: %s", len(new_fields_needed), [f.name for f in new_fields_needed])
+                    new_schema = list(table.schema) + new_fields_needed
+                    table.schema = new_schema
+                    table = self._client.update_table(table, ["schema"])
+                    _LOGGER.info("Table schema updated successfully")
+
                 return table
+
             except Exception:
                 # Table doesn't exist, create it
                 _LOGGER.info("Creating table: %s", self._table_ref.table_id)
-                
+
                 # Create table schema
                 schema = [
                     bigquery.SchemaField(field["name"], field["type"], field["mode"])
                     for field in BIGQUERY_SCHEMA
                 ]
-                
+
                 # Create table
                 table = bigquery.Table(self._table_ref, schema=schema)
-                
+
                 # Set up partitioning and clustering
                 table.time_partitioning = bigquery.TimePartitioning(
                     type_=bigquery.TimePartitioningType.DAY,
                     field="last_changed"
                 )
                 table.clustering_fields = ["entity_id", "domain"]
-                
+
                 # Create the table
                 created_table = self._client.create_table(table)
                 _LOGGER.info("Table created successfully: %s", created_table.table_id)
                 return created_table
-        
+
         # Run in executor to avoid blocking
-        await self.hass.async_add_executor_job(_create_table)
+        await self.hass.async_add_executor_job(_create_or_update_table)
 
     async def async_manual_export(
         self, 
@@ -646,7 +747,10 @@ class BigQueryExportService:
                     
                     # Extract friendly_name
                     friendly_name = attributes.get('friendly_name', row.entity_id)
-                    
+
+                    # Get entity metadata (labels and areas)
+                    entity_metadata = get_entity_metadata(self.hass, row.entity_id)
+
                     # Create BigQuery row (convert datetime objects to ISO strings)
                     bq_row = {
                         "entity_id": row.entity_id,
@@ -659,8 +763,14 @@ class BigQueryExportService:
                         "domain": domain,
                         "friendly_name": friendly_name,
                         "unit_of_measurement": unit_of_measurement,
+                        "area_id": entity_metadata["area_id"],
+                        "area_name": entity_metadata["area_name"],
                         "export_timestamp": export_timestamp,
                     }
+
+                    # Only add labels if non-empty (REPEATED fields can be omitted but not empty)
+                    if entity_metadata["labels"]:
+                        bq_row["labels"] = entity_metadata["labels"]
                     
                     rows.append(bq_row)
                     
@@ -794,8 +904,12 @@ class BigQueryExportService:
                     
                     # Extract friendly_name
                     friendly_name = attributes.get('friendly_name', row.entity_id)
-                    
+
+                    # Get entity metadata (labels and areas)
+                    entity_metadata = get_entity_metadata(self.hass, row.entity_id)
+
                     # Create record for JSONL file
+                    # Note: Only include labels field if there are actual labels (BigQuery REPEATED field)
                     record = {
                         "entity_id": row.entity_id,
                         "state": row.state,
@@ -807,8 +921,14 @@ class BigQueryExportService:
                         "domain": domain,
                         "friendly_name": friendly_name,
                         "unit_of_measurement": unit_of_measurement,
+                        "area_id": entity_metadata["area_id"],
+                        "area_name": entity_metadata["area_name"],
                         "export_timestamp": export_timestamp,
                     }
+
+                    # Only add labels if non-empty (REPEATED fields can be omitted but not empty in some contexts)
+                    if entity_metadata["labels"]:
+                        record["labels"] = entity_metadata["labels"]
                     
                     # Write as JSONL (one JSON object per line)
                     temp_file.write(json.dumps(record) + '\n')
@@ -869,20 +989,33 @@ class BigQueryExportService:
                 
                 merge_query = f"""
                 MERGE `{self._table_ref.project}.{self._table_ref.dataset_id}.{self._table_ref.table_id}` AS target
-                USING `{temp_table_ref.project}.{temp_table_ref.dataset_id}.{temp_table_ref.table_id}` AS source
-                ON target.entity_id = source.entity_id 
+                USING (
+                  SELECT
+                    entity_id, state, attributes, last_changed, last_updated,
+                    context_id, context_user_id, domain, friendly_name,
+                    unit_of_measurement, area_id, area_name, labels, export_timestamp
+                  FROM `{temp_table_ref.project}.{temp_table_ref.dataset_id}.{temp_table_ref.table_id}`
+                  QUALIFY ROW_NUMBER() OVER (PARTITION BY entity_id, last_changed ORDER BY last_updated DESC) = 1
+                ) AS source
+                ON target.entity_id = source.entity_id
                    AND target.last_changed = source.last_changed
+                WHEN MATCHED THEN
+                  UPDATE SET
+                    area_id = source.area_id,
+                    area_name = source.area_name,
+                    labels = source.labels
                 WHEN NOT MATCHED THEN
                   INSERT (
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
-                    unit_of_measurement, export_timestamp
+                    unit_of_measurement, area_id, area_name, labels, export_timestamp
                   )
                   VALUES (
                     source.entity_id, source.state, source.attributes,
                     source.last_changed, source.last_updated, source.context_id,
                     source.context_user_id, source.domain, source.friendly_name,
-                    source.unit_of_measurement, source.export_timestamp
+                    source.unit_of_measurement, source.area_id, source.area_name,
+                    source.labels, source.export_timestamp
                   )
                 """
                 
@@ -960,20 +1093,33 @@ class BigQueryExportService:
                 
                 merge_query = f"""
                 MERGE `{self._table_ref.project}.{self._table_ref.dataset_id}.{self._table_ref.table_id}` AS target
-                USING `{temp_table_ref.project}.{temp_table_ref.dataset_id}.{temp_table_ref.table_id}` AS source
-                ON target.entity_id = source.entity_id 
+                USING (
+                  SELECT
+                    entity_id, state, attributes, last_changed, last_updated,
+                    context_id, context_user_id, domain, friendly_name,
+                    unit_of_measurement, area_id, area_name, labels, export_timestamp
+                  FROM `{temp_table_ref.project}.{temp_table_ref.dataset_id}.{temp_table_ref.table_id}`
+                  QUALIFY ROW_NUMBER() OVER (PARTITION BY entity_id, last_changed ORDER BY last_updated DESC) = 1
+                ) AS source
+                ON target.entity_id = source.entity_id
                    AND target.last_changed = source.last_changed
+                WHEN MATCHED THEN
+                  UPDATE SET
+                    area_id = source.area_id,
+                    area_name = source.area_name,
+                    labels = source.labels
                 WHEN NOT MATCHED THEN
                   INSERT (
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
-                    unit_of_measurement, export_timestamp
+                    unit_of_measurement, area_id, area_name, labels, export_timestamp
                   )
                   VALUES (
                     source.entity_id, source.state, source.attributes,
                     source.last_changed, source.last_updated, source.context_id,
                     source.context_user_id, source.domain, source.friendly_name,
-                    source.unit_of_measurement, source.export_timestamp
+                    source.unit_of_measurement, source.area_id, source.area_name,
+                    source.labels, source.export_timestamp
                   )
                 """
                 
