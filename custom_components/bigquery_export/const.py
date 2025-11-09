@@ -50,10 +50,10 @@ EXPORT_SCHEDULES = {
 # BigQuery schema fields - Unified Timeline Model
 # Single table for all HA activity: states, automations, scripts, scenes
 BIGQUERY_SCHEMA = [
-    # Core identity
-    {"name": "record_id", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "timestamp", "type": "TIMESTAMP", "mode": "REQUIRED"},
-    {"name": "record_type", "type": "STRING", "mode": "REQUIRED"},  # state, automation, script, scene
+    # Core identity (NULLABLE for backward compatibility - will populate when events are added)
+    {"name": "record_id", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "timestamp", "type": "TIMESTAMP", "mode": "NULLABLE"},
+    {"name": "record_type", "type": "STRING", "mode": "NULLABLE"},  # state, automation, script, scene
 
     # Entity info (applies to all records)
     {"name": "entity_id", "type": "STRING", "mode": "REQUIRED"},
