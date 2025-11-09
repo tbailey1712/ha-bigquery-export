@@ -1072,7 +1072,10 @@ class BigQueryExportService:
                   SELECT
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
-                    unit_of_measurement, area_id, area_name, labels, export_timestamp
+                    unit_of_measurement, area_id, area_name, labels,
+                    hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
+                    month, season, state_changed,
+                    export_timestamp
                   FROM `{temp_table_ref.project}.{temp_table_ref.dataset_id}.{temp_table_ref.table_id}`
                   QUALIFY ROW_NUMBER() OVER (PARTITION BY entity_id, last_changed ORDER BY last_updated DESC) = 1
                 ) AS source
@@ -1191,7 +1194,10 @@ class BigQueryExportService:
                   SELECT
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
-                    unit_of_measurement, area_id, area_name, labels, export_timestamp
+                    unit_of_measurement, area_id, area_name, labels,
+                    hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
+                    month, season, state_changed,
+                    export_timestamp
                   FROM `{temp_table_ref.project}.{temp_table_ref.dataset_id}.{temp_table_ref.table_id}`
                   QUALIFY ROW_NUMBER() OVER (PARTITION BY entity_id, last_changed ORDER BY last_updated DESC) = 1
                 ) AS source
