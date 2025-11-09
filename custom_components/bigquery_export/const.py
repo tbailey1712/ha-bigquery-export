@@ -86,6 +86,9 @@ BIGQUERY_SCHEMA = [
     {"name": "is_weekend", "type": "BOOLEAN", "mode": "NULLABLE"},
     {"name": "is_night", "type": "BOOLEAN", "mode": "NULLABLE"},
     {"name": "time_of_day", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "month", "type": "INTEGER", "mode": "NULLABLE"},
+    {"name": "season", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "state_changed", "type": "BOOLEAN", "mode": "NULLABLE"},
 
     {"name": "export_timestamp", "type": "TIMESTAMP", "mode": "REQUIRED"},
 ]

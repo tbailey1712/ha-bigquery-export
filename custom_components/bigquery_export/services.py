@@ -60,17 +60,19 @@ from .utils import (
 )
 
 
-def compute_time_features(timestamp: datetime) -> dict[str, Any]:
+def compute_time_features(timestamp: datetime, last_updated: datetime = None) -> dict[str, Any]:
     """Compute time-based features for ML from a timestamp.
 
     Args:
-        timestamp: Datetime object to extract features from
+        timestamp: Datetime object to extract features from (last_changed)
+        last_updated: Optional last_updated timestamp for state_changed detection
 
     Returns:
         Dictionary with time-based features
     """
     hour = timestamp.hour
     day_of_week = timestamp.weekday()  # 0=Monday, 6=Sunday
+    month = timestamp.month  # 1-12
 
     # Determine time of day
     if 6 <= hour < 12:
@@ -82,12 +84,32 @@ def compute_time_features(timestamp: datetime) -> dict[str, Any]:
     else:
         time_of_day = "night"
 
+    # Determine season (Northern Hemisphere)
+    if month in (12, 1, 2):
+        season = "winter"
+    elif month in (3, 4, 5):
+        season = "spring"
+    elif month in (6, 7, 8):
+        season = "summer"
+    else:  # 9, 10, 11
+        season = "fall"
+
+    # State changed = last_changed differs from last_updated
+    # If they're the same, it was just an attribute update, not a state change
+    state_changed = True
+    if last_updated:
+        # Compare timestamps (allow 1 second tolerance for rounding)
+        state_changed = abs((timestamp - last_updated).total_seconds()) > 1
+
     return {
         "hour_of_day": hour,
         "day_of_week": day_of_week,
         "is_weekend": day_of_week >= 5,  # Saturday=5, Sunday=6
         "is_night": hour < 6 or hour >= 21,  # 9pm-6am
         "time_of_day": time_of_day,
+        "month": month,
+        "season": season,
+        "state_changed": state_changed,
     }
 
 
@@ -783,7 +805,7 @@ class BigQueryExportService:
                     entity_metadata = get_entity_metadata(self.hass, row.entity_id)
 
                     # Compute time-based features for ML
-                    time_features = compute_time_features(last_changed) if last_changed else {}
+                    time_features = compute_time_features(last_changed, last_updated) if last_changed else {}
 
                     # Create BigQuery row (convert datetime objects to ISO strings)
                     bq_row = {
@@ -805,6 +827,9 @@ class BigQueryExportService:
                         "is_weekend": time_features.get("is_weekend"),
                         "is_night": time_features.get("is_night"),
                         "time_of_day": time_features.get("time_of_day"),
+                        "month": time_features.get("month"),
+                        "season": time_features.get("season"),
+                        "state_changed": time_features.get("state_changed"),
                         "export_timestamp": export_timestamp,
                     }
 
@@ -949,7 +974,7 @@ class BigQueryExportService:
                     entity_metadata = get_entity_metadata(self.hass, row.entity_id)
 
                     # Compute time-based features for ML
-                    time_features = compute_time_features(last_changed) if last_changed else {}
+                    time_features = compute_time_features(last_changed, last_updated) if last_changed else {}
 
                     # Create record for JSONL file
                     # Note: Only include labels field if there are actual labels (BigQuery REPEATED field)
@@ -972,6 +997,9 @@ class BigQueryExportService:
                         "is_weekend": time_features.get("is_weekend"),
                         "is_night": time_features.get("is_night"),
                         "time_of_day": time_features.get("time_of_day"),
+                        "month": time_features.get("month"),
+                        "season": time_features.get("season"),
+                        "state_changed": time_features.get("state_changed"),
                         "export_timestamp": export_timestamp,
                     }
 
@@ -1057,13 +1085,17 @@ class BigQueryExportService:
                     day_of_week = source.day_of_week,
                     is_weekend = source.is_weekend,
                     is_night = source.is_night,
-                    time_of_day = source.time_of_day
+                    time_of_day = source.time_of_day,
+                    month = source.month,
+                    season = source.season,
+                    state_changed = source.state_changed
                 WHEN NOT MATCHED THEN
                   INSERT (
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
                     unit_of_measurement, area_id, area_name, labels,
                     hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
+                    month, season, state_changed,
                     export_timestamp
                   )
                   VALUES (
@@ -1074,6 +1106,7 @@ class BigQueryExportService:
                     source.labels,
                     source.hour_of_day, source.day_of_week, source.is_weekend,
                     source.is_night, source.time_of_day,
+                    source.month, source.season, source.state_changed,
                     source.export_timestamp
                   )
                 """
@@ -1171,13 +1204,17 @@ class BigQueryExportService:
                     day_of_week = source.day_of_week,
                     is_weekend = source.is_weekend,
                     is_night = source.is_night,
-                    time_of_day = source.time_of_day
+                    time_of_day = source.time_of_day,
+                    month = source.month,
+                    season = source.season,
+                    state_changed = source.state_changed
                 WHEN NOT MATCHED THEN
                   INSERT (
                     entity_id, state, attributes, last_changed, last_updated,
                     context_id, context_user_id, domain, friendly_name,
                     unit_of_measurement, area_id, area_name, labels,
                     hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
+                    month, season, state_changed,
                     export_timestamp
                   )
                   VALUES (
@@ -1188,6 +1225,7 @@ class BigQueryExportService:
                     source.labels,
                     source.hour_of_day, source.day_of_week, source.is_weekend,
                     source.is_night, source.time_of_day,
+                    source.month, source.season, source.state_changed,
                     source.export_timestamp
                   )
                 """
