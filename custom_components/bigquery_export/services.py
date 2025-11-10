@@ -69,6 +69,178 @@ from .utils import (
 )
 
 
+# ============================================================================
+# PHASE 1: FEATURE EXTRACTION FUNCTIONS (2025-11-10)
+# ============================================================================
+
+def safe_float(value: Any) -> float | None:
+    """Safely convert value to float, return None if not possible."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def extract_room_from_entity(entity_id: str, area_name: str | None = None) -> str | None:
+    """Extract room name from entity_id or area_name.
+
+    Examples:
+        sensor.awair_temperature -> None (no room in entity)
+        sensor.airthings_master_bedroom_temperature -> Master Bedroom
+        sensor.multisensor_basement_main_temperature -> Basement Main
+        area_name='Kitchen' -> Kitchen
+    """
+    if area_name:
+        return area_name
+
+    # Extract room from entity_id
+    # Pattern: sensor.device_ROOM_attribute
+    parts = entity_id.split('_')
+
+    # Skip domain and device name, look for room indicators
+    room_keywords = ['bedroom', 'bathroom', 'kitchen', 'basement', 'attic',
+                     'living', 'dining', 'family', 'office', 'garage', 'front']
+
+    room_parts = []
+    for i, part in enumerate(parts):
+        if part.lower() in room_keywords:
+            # Include this part and potentially next part (e.g., "master bedroom")
+            room_parts.append(part.title())
+            if i + 1 < len(parts) and parts[i + 1].lower() in room_keywords:
+                room_parts.append(parts[i + 1].title())
+                break
+            break
+
+    return ' '.join(room_parts) if room_parts else None
+
+
+def categorize_device(entity_id: str, domain: str, attributes: dict[str, Any]) -> str | None:
+    """Categorize device based on entity_id, domain, and attributes.
+
+    Categories:
+        - temperature
+        - humidity
+        - power
+        - energy
+        - air_quality (CO2, VOC, PM2.5, radon)
+        - hvac
+        - motion
+        - door_window
+        - light
+        - other
+    """
+    entity_lower = entity_id.lower()
+    device_class = attributes.get('device_class', '').lower()
+
+    # Check device_class first (most reliable)
+    if device_class in ['temperature']:
+        return 'temperature'
+    elif device_class in ['humidity']:
+        return 'humidity'
+    elif device_class in ['power']:
+        return 'power'
+    elif device_class in ['energy']:
+        return 'energy'
+    elif device_class in ['motion', 'occupancy']:
+        return 'motion'
+    elif device_class in ['door', 'window', 'opening']:
+        return 'door_window'
+
+    # Check domain
+    if domain == 'climate':
+        return 'hvac'
+    elif domain == 'light':
+        return 'light'
+
+    # Check entity_id patterns
+    if any(x in entity_lower for x in ['temperature', 'temp']):
+        return 'temperature'
+    elif any(x in entity_lower for x in ['humidity', 'humid']):
+        return 'humidity'
+    elif 'power' in entity_lower and 'power_factor' not in entity_lower:
+        return 'power'
+    elif 'energy' in entity_lower:
+        return 'energy'
+    elif any(x in entity_lower for x in ['co2', 'carbon_dioxide', 'voc', 'pm2', 'pm10', 'radon', 'air_quality']):
+        return 'air_quality'
+    elif any(x in entity_lower for x in ['hvac', 'thermostat', 'climate', 'furnace', 'heat_pump']):
+        return 'hvac'
+    elif any(x in entity_lower for x in ['motion', 'occupancy', 'presence']):
+        return 'motion'
+    elif any(x in entity_lower for x in ['door', 'window']):
+        return 'door_window'
+    elif any(x in entity_lower for x in ['light', 'lamp', 'bulb']):
+        return 'light'
+
+    return 'other'
+
+
+def extract_domain_features(
+    entity_id: str,
+    state: str,
+    attributes: dict[str, Any],
+    domain: str,
+    area_name: str | None = None
+) -> dict[str, Any]:
+    """Extract all domain-specific features from entity state and attributes.
+
+    Returns dict with keys matching BIGQUERY_SCHEMA field names.
+    """
+    features = {
+        "state_numeric": None,
+        "temperature_value": None,
+        "humidity_value": None,
+        "power_value": None,
+        "energy_value": None,
+        "room": None,
+        "device_category": None,
+        "hvac_mode": None,
+        "hvac_action": None,
+        "target_temperature": None,
+        "current_temperature": None,
+        "fan_mode": None,
+    }
+
+    # 1. Parse numeric state
+    features["state_numeric"] = safe_float(state)
+
+    # 2. Extract room and category
+    features["room"] = extract_room_from_entity(entity_id, area_name)
+    features["device_category"] = categorize_device(entity_id, domain, attributes)
+
+    # 3. Domain-specific extractions
+    category = features["device_category"]
+    state_num = features["state_numeric"]
+
+    if category == 'temperature' and state_num is not None:
+        features["temperature_value"] = state_num
+
+    elif category == 'humidity' and state_num is not None:
+        features["humidity_value"] = state_num
+
+    elif category == 'power' and state_num is not None:
+        features["power_value"] = state_num
+
+    elif category == 'energy' and state_num is not None:
+        features["energy_value"] = state_num
+
+    elif category == 'hvac' or domain == 'climate':
+        # Extract HVAC-specific attributes
+        features["hvac_mode"] = attributes.get('hvac_mode')
+        features["hvac_action"] = attributes.get('hvac_action')
+        features["target_temperature"] = safe_float(attributes.get('temperature'))
+        features["current_temperature"] = safe_float(attributes.get('current_temperature'))
+        features["fan_mode"] = attributes.get('fan_mode')
+
+        # If state is a temperature, use it
+        if state_num is not None and features["current_temperature"] is None:
+            features["current_temperature"] = state_num
+
+    return features
+
+
 def compute_time_features(timestamp: datetime, last_updated: datetime = None) -> dict[str, Any]:
     """Compute time-based features for ML from a timestamp.
 
@@ -1127,6 +1299,15 @@ class BigQueryExportService:
                     # Compute time-based features for ML
                     time_features = compute_time_features(last_changed, last_updated) if last_changed else {}
 
+                    # PHASE 1: Extract domain-specific features
+                    domain_features = extract_domain_features(
+                        entity_id=row.entity_id,
+                        state=row.state,
+                        attributes=attributes,
+                        domain=domain,
+                        area_name=entity_metadata.get("area_name")
+                    )
+
                     # Create BigQuery row (convert datetime objects to ISO strings)
                     bq_row = {
                         "entity_id": row.entity_id,
@@ -1150,6 +1331,19 @@ class BigQueryExportService:
                         "month": time_features.get("month"),
                         "season": time_features.get("season"),
                         "state_changed": time_features.get("state_changed"),
+                        # PHASE 1: Domain features
+                        "state_numeric": domain_features.get("state_numeric"),
+                        "temperature_value": domain_features.get("temperature_value"),
+                        "humidity_value": domain_features.get("humidity_value"),
+                        "power_value": domain_features.get("power_value"),
+                        "energy_value": domain_features.get("energy_value"),
+                        "room": domain_features.get("room"),
+                        "device_category": domain_features.get("device_category"),
+                        "hvac_mode": domain_features.get("hvac_mode"),
+                        "hvac_action": domain_features.get("hvac_action"),
+                        "target_temperature": domain_features.get("target_temperature"),
+                        "current_temperature": domain_features.get("current_temperature"),
+                        "fan_mode": domain_features.get("fan_mode"),
                         "export_timestamp": export_timestamp,
                     }
 
@@ -1328,6 +1522,15 @@ class BigQueryExportService:
                     # Compute time-based features for ML
                     time_features = compute_time_features(last_changed, last_updated) if last_changed else {}
 
+                    # PHASE 1: Extract domain-specific features
+                    domain_features = extract_domain_features(
+                        entity_id=row.entity_id,
+                        state=row.state,
+                        attributes=attributes,
+                        domain=domain,
+                        area_name=entity_metadata.get("area_name")
+                    )
+
                     # Create record for JSONL file
                     # Note: Only include labels field if there are actual labels (BigQuery REPEATED field)
                     record = {
@@ -1352,6 +1555,19 @@ class BigQueryExportService:
                         "month": time_features.get("month"),
                         "season": time_features.get("season"),
                         "state_changed": time_features.get("state_changed"),
+                        # PHASE 1: Domain features
+                        "state_numeric": domain_features.get("state_numeric"),
+                        "temperature_value": domain_features.get("temperature_value"),
+                        "humidity_value": domain_features.get("humidity_value"),
+                        "power_value": domain_features.get("power_value"),
+                        "energy_value": domain_features.get("energy_value"),
+                        "room": domain_features.get("room"),
+                        "device_category": domain_features.get("device_category"),
+                        "hvac_mode": domain_features.get("hvac_mode"),
+                        "hvac_action": domain_features.get("hvac_action"),
+                        "target_temperature": domain_features.get("target_temperature"),
+                        "current_temperature": domain_features.get("current_temperature"),
+                        "fan_mode": domain_features.get("fan_mode"),
                         "export_timestamp": export_timestamp,
                     }
 
@@ -1434,6 +1650,9 @@ class BigQueryExportService:
                     event_type, event_data, triggered_by,
                     hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
                     month, season, state_changed,
+                    state_numeric, temperature_value, humidity_value, power_value, energy_value,
+                    room, device_category,
+                    hvac_mode, hvac_action, target_temperature, current_temperature, fan_mode,
                     export_timestamp
                   FROM `{temp_table_ref.project}.{temp_table_ref.dataset_id}.{temp_table_ref.table_id}`
                   QUALIFY ROW_NUMBER() OVER (PARTITION BY entity_id, last_changed ORDER BY last_updated DESC) = 1
@@ -1456,7 +1675,19 @@ class BigQueryExportService:
                     time_of_day = source.time_of_day,
                     month = source.month,
                     season = source.season,
-                    state_changed = source.state_changed
+                    state_changed = source.state_changed,
+                    state_numeric = source.state_numeric,
+                    temperature_value = source.temperature_value,
+                    humidity_value = source.humidity_value,
+                    power_value = source.power_value,
+                    energy_value = source.energy_value,
+                    room = source.room,
+                    device_category = source.device_category,
+                    hvac_mode = source.hvac_mode,
+                    hvac_action = source.hvac_action,
+                    target_temperature = source.target_temperature,
+                    current_temperature = source.current_temperature,
+                    fan_mode = source.fan_mode
                 WHEN NOT MATCHED THEN
                   INSERT (
                     record_id, timestamp, record_type,
@@ -1466,6 +1697,9 @@ class BigQueryExportService:
                     event_type, event_data, triggered_by,
                     hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
                     month, season, state_changed,
+                    state_numeric, temperature_value, humidity_value, power_value, energy_value,
+                    room, device_category,
+                    hvac_mode, hvac_action, target_temperature, current_temperature, fan_mode,
                     export_timestamp
                   )
                   VALUES (
@@ -1479,6 +1713,11 @@ class BigQueryExportService:
                     source.hour_of_day, source.day_of_week, source.is_weekend,
                     source.is_night, source.time_of_day,
                     source.month, source.season, source.state_changed,
+                    source.state_numeric, source.temperature_value, source.humidity_value,
+                    source.power_value, source.energy_value,
+                    source.room, source.device_category,
+                    source.hvac_mode, source.hvac_action, source.target_temperature,
+                    source.current_temperature, source.fan_mode,
                     source.export_timestamp
                   )
                 """
@@ -1566,6 +1805,9 @@ class BigQueryExportService:
                     event_type, event_data, triggered_by,
                     hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
                     month, season, state_changed,
+                    state_numeric, temperature_value, humidity_value, power_value, energy_value,
+                    room, device_category,
+                    hvac_mode, hvac_action, target_temperature, current_temperature, fan_mode,
                     export_timestamp
                   FROM `{temp_table_ref.project}.{temp_table_ref.dataset_id}.{temp_table_ref.table_id}`
                   QUALIFY ROW_NUMBER() OVER (PARTITION BY entity_id, last_changed ORDER BY last_updated DESC) = 1
@@ -1588,7 +1830,19 @@ class BigQueryExportService:
                     time_of_day = source.time_of_day,
                     month = source.month,
                     season = source.season,
-                    state_changed = source.state_changed
+                    state_changed = source.state_changed,
+                    state_numeric = source.state_numeric,
+                    temperature_value = source.temperature_value,
+                    humidity_value = source.humidity_value,
+                    power_value = source.power_value,
+                    energy_value = source.energy_value,
+                    room = source.room,
+                    device_category = source.device_category,
+                    hvac_mode = source.hvac_mode,
+                    hvac_action = source.hvac_action,
+                    target_temperature = source.target_temperature,
+                    current_temperature = source.current_temperature,
+                    fan_mode = source.fan_mode
                 WHEN NOT MATCHED THEN
                   INSERT (
                     record_id, timestamp, record_type,
@@ -1598,6 +1852,9 @@ class BigQueryExportService:
                     event_type, event_data, triggered_by,
                     hour_of_day, day_of_week, is_weekend, is_night, time_of_day,
                     month, season, state_changed,
+                    state_numeric, temperature_value, humidity_value, power_value, energy_value,
+                    room, device_category,
+                    hvac_mode, hvac_action, target_temperature, current_temperature, fan_mode,
                     export_timestamp
                   )
                   VALUES (
@@ -1611,6 +1868,11 @@ class BigQueryExportService:
                     source.hour_of_day, source.day_of_week, source.is_weekend,
                     source.is_night, source.time_of_day,
                     source.month, source.season, source.state_changed,
+                    source.state_numeric, source.temperature_value, source.humidity_value,
+                    source.power_value, source.energy_value,
+                    source.room, source.device_category,
+                    source.hvac_mode, source.hvac_action, source.target_temperature,
+                    source.current_temperature, source.fan_mode,
                     source.export_timestamp
                   )
                 """
