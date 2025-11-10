@@ -56,3 +56,6 @@ htmlcov/
 .env.local
 test_*.json
 *_test.json
+
+# Private implementation-specific files
+private/
