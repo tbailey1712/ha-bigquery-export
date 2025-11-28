@@ -1,0 +1,56 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle with gradient -->
+  <defs>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4285F4;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#185ABC;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="accentGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FBBC04;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#EA4335;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Main circle background -->
+  <circle cx="128" cy="128" r="120" fill="url(#bgGradient)"/>
+
+  <!-- Database cylinder (representing Home Assistant data) -->
+  <g id="database">
+    <!-- Top ellipse -->
+    <ellipse cx="90" cy="100" rx="35" ry="12" fill="#FFFFFF" opacity="0.9"/>
+    <!-- Cylinder body -->
+    <rect x="55" y="100" width="70" height="60" fill="#FFFFFF" opacity="0.9"/>
+    <!-- Bottom ellipse -->
+    <ellipse cx="90" cy="160" rx="35" ry="12" fill="#E8EAED" opacity="0.9"/>
+    <!-- Vertical lines for detail -->
+    <line x1="65" y1="105" x2="65" y2="155" stroke="#4285F4" stroke-width="2" opacity="0.3"/>
+    <line x1="90" y1="105" x2="90" y2="155" stroke="#4285F4" stroke-width="2" opacity="0.3"/>
+    <line x1="115" y1="105" x2="115" y2="155" stroke="#4285F4" stroke-width="2" opacity="0.3"/>
+  </g>
+
+  <!-- Arrow pointing right (export) -->
+  <g id="export-arrow">
+    <path d="M 130 130 L 150 130 L 150 120 L 170 135 L 150 150 L 150 140 L 130 140 Z"
+          fill="url(#accentGradient)" opacity="0.95"/>
+  </g>
+
+  <!-- BigQuery logo simplified (hexagon pattern) -->
+  <g id="bigquery">
+    <polygon points="195,110 210,120 210,140 195,150 180,140 180,120"
+             fill="#FFFFFF" opacity="0.9"/>
+    <polygon points="195,115 207,123 207,137 195,145 183,137 183,123"
+             fill="#4285F4" opacity="0.3"/>
+    <!-- BQ text -->
+    <text x="188" y="138" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#185ABC">BQ</text>
+  </g>
+
+  <!-- Decorative data dots -->
+  <circle cx="70" cy="120" r="3" fill="#4285F4" opacity="0.6"/>
+  <circle cx="80" cy="130" r="3" fill="#4285F4" opacity="0.6"/>
+  <circle cx="100" cy="125" r="3" fill="#4285F4" opacity="0.6"/>
+  <circle cx="90" cy="140" r="3" fill="#4285F4" opacity="0.6"/>
+
+  <!-- Subtle text at bottom -->
+  <text x="128" y="220" font-family="Arial, sans-serif" font-size="20" font-weight="600"
+        fill="#FFFFFF" text-anchor="middle" opacity="0.8">BigQuery Export</text>
+</svg>

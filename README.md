@@ -12,6 +12,13 @@ Built for enterprise-grade data workflows with automatic deduplication, bulk upl
 
 ## 🎯 Key Features
 
+### 🔍 **Database Analysis & Diagnostics** ✨ NEW
+- **Local Database Inspection**: Check your recorder retention and available data
+- **Export Coverage Analysis**: Compare local DB vs BigQuery to identify gaps
+- **Gap Detection**: Find missing date ranges automatically
+- **Backfill Cost Estimation**: Calculate time, size, and costs before exporting
+- **Visual Sensors**: See retention, coverage %, and gaps on your dashboard
+
 ### 📊 **Smart Data Export**
 - **Bulk Upload for Large Datasets**: Automatically switches to file-based bulk upload for datasets >10K records
 - **Intelligent Chunking**: Handles massive historical exports (90+ days) via optimized 7-day chunks

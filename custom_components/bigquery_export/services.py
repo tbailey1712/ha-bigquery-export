@@ -228,7 +228,8 @@ def extract_domain_features(
 
     elif category == 'hvac' or domain == 'climate':
         # Extract HVAC-specific attributes
-        features["hvac_mode"] = attributes.get('hvac_mode')
+        # For climate entities, the mode is usually in the state field
+        features["hvac_mode"] = attributes.get('hvac_mode') or (state if domain == 'climate' and state not in ['unavailable', 'unknown'] else None)
         features["hvac_action"] = attributes.get('hvac_action')
         features["target_temperature"] = safe_float(attributes.get('temperature'))
         features["current_temperature"] = safe_float(attributes.get('current_temperature'))
@@ -292,6 +293,111 @@ def compute_time_features(timestamp: datetime, last_updated: datetime = None) ->
         "season": season,
         "state_changed": state_changed,
     }
+
+
+# ============================================================================
+# PHASE 2: ADVANCED FEATURE EXTRACTION (2025-11-10)
+# ============================================================================
+
+def encode_cyclic_time(timestamp: datetime) -> dict[str, float]:
+    """Encode time cyclically using sin/cos for ML.
+
+    Why: Prevents hour 23 and hour 0 being treated as far apart in ML models.
+    ML models treat continuous features linearly, so hour=23 and hour=0 would
+    appear to be 23 units apart. Using sin/cos encoding, they're correctly
+    represented as adjacent points on a circle.
+
+    Args:
+        timestamp: Datetime object to extract features from
+
+    Returns:
+        Dictionary with cyclic encodings: hour_sin, hour_cos, day_sin, day_cos
+    """
+    import math
+
+    hour = timestamp.hour
+    day_of_week = timestamp.weekday()
+
+    # Encode hour (0-23) as point on unit circle
+    hour_rad = 2 * math.pi * hour / 24
+
+    # Encode day (0-6) as point on unit circle
+    day_rad = 2 * math.pi * day_of_week / 7
+
+    return {
+        "hour_sin": math.sin(hour_rad),
+        "hour_cos": math.cos(hour_rad),
+        "day_sin": math.sin(day_rad),
+        "day_cos": math.cos(day_rad),
+    }
+
+
+def infer_occupancy(
+    co2: float | None,
+    motion_recently: bool,
+    power: float | None,
+    room: str | None
+) -> tuple[float | None, str | None]:
+    """Infer occupancy probability from multiple signals.
+
+    Uses weighted combination of:
+    - CO2 levels (strongest indicator, weight=0.5)
+    - Motion detection (weight=0.3)
+    - Power consumption (weight=0.2)
+
+    Args:
+        co2: CO2 level in ppm (None if unavailable)
+        motion_recently: True if motion detected in last 10 minutes
+        power: Power consumption in watts (None if unavailable)
+        room: Room name (reserved for future use)
+
+    Returns:
+        Tuple of (occupancy_score: 0-1, confidence: high/medium/low)
+        Returns (None, None) if no signals available
+    """
+    signals = []
+    weights = []
+
+    # CO2 signal (strongest indicator)
+    if co2 is not None:
+        if co2 > 800:
+            signals.append(1.0)  # Definitely occupied
+            weights.append(0.5)
+        elif co2 > 600:
+            signals.append(0.7)  # Probably occupied
+            weights.append(0.5)
+        elif co2 < 450:
+            signals.append(0.0)  # Definitely not occupied
+            weights.append(0.5)
+        else:
+            signals.append(0.3)  # Likely not occupied
+            weights.append(0.3)
+
+    # Motion signal
+    if motion_recently:
+        signals.append(1.0)
+        weights.append(0.3)
+
+    # Power signal (moderate indicator)
+    if power is not None and power > 50:  # More than idle power
+        signals.append(0.6)
+        weights.append(0.2)
+
+    if not signals:
+        return None, None
+
+    # Weighted average
+    score = sum(s * w for s, w in zip(signals, weights)) / sum(weights)
+
+    # Confidence based on number of signals
+    if len(signals) >= 2:
+        confidence = "high"
+    elif len(signals) == 1 and weights[0] >= 0.5:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return score, confidence
 
 
 def get_entity_metadata(hass: HomeAssistant, entity_id: str) -> dict[str, Any]:
@@ -1308,6 +1414,16 @@ class BigQueryExportService:
                         area_name=entity_metadata.get("area_name")
                     )
 
+                    # PHASE 2: Cyclic time encoding for ML
+                    cyclic_time = encode_cyclic_time(last_changed) if last_changed else {}
+
+                    # PHASE 2: Occupancy inference (placeholder - needs historical data)
+                    # TODO: Implement lookback for recent motion/CO2/power data
+                    occupancy_score = None
+                    occupancy_confidence = None
+                    # For now, we'll compute occupancy in a future enhancement that has
+                    # access to recent history within the export window
+
                     # Create BigQuery row (convert datetime objects to ISO strings)
                     bq_row = {
                         "entity_id": row.entity_id,
@@ -1344,6 +1460,18 @@ class BigQueryExportService:
                         "target_temperature": domain_features.get("target_temperature"),
                         "current_temperature": domain_features.get("current_temperature"),
                         "fan_mode": domain_features.get("fan_mode"),
+                        # PHASE 2: Cyclic time encoding
+                        "hour_sin": cyclic_time.get("hour_sin"),
+                        "hour_cos": cyclic_time.get("hour_cos"),
+                        "day_sin": cyclic_time.get("day_sin"),
+                        "day_cos": cyclic_time.get("day_cos"),
+                        # PHASE 2: Rate of change (placeholder - needs previous state)
+                        "state_delta": None,
+                        "state_derivative": None,
+                        "time_since_last_change": None,
+                        # PHASE 2: Occupancy inference
+                        "occupancy_score": occupancy_score,
+                        "occupancy_confidence": occupancy_confidence,
                         "export_timestamp": export_timestamp,
                     }
 
@@ -1531,6 +1659,13 @@ class BigQueryExportService:
                         area_name=entity_metadata.get("area_name")
                     )
 
+                    # PHASE 2: Cyclic time encoding for ML
+                    cyclic_time = encode_cyclic_time(last_changed) if last_changed else {}
+
+                    # PHASE 2: Occupancy inference (placeholder - needs historical data)
+                    occupancy_score = None
+                    occupancy_confidence = None
+
                     # Create record for JSONL file
                     # Note: Only include labels field if there are actual labels (BigQuery REPEATED field)
                     record = {
@@ -1568,6 +1703,18 @@ class BigQueryExportService:
                         "target_temperature": domain_features.get("target_temperature"),
                         "current_temperature": domain_features.get("current_temperature"),
                         "fan_mode": domain_features.get("fan_mode"),
+                        # PHASE 2: Cyclic time encoding
+                        "hour_sin": cyclic_time.get("hour_sin"),
+                        "hour_cos": cyclic_time.get("hour_cos"),
+                        "day_sin": cyclic_time.get("day_sin"),
+                        "day_cos": cyclic_time.get("day_cos"),
+                        # PHASE 2: Rate of change (placeholder - needs previous state)
+                        "state_delta": None,
+                        "state_derivative": None,
+                        "time_since_last_change": None,
+                        # PHASE 2: Occupancy inference
+                        "occupancy_score": occupancy_score,
+                        "occupancy_confidence": occupancy_confidence,
                         "export_timestamp": export_timestamp,
                     }
 
@@ -1653,6 +1800,9 @@ class BigQueryExportService:
                     state_numeric, temperature_value, humidity_value, power_value, energy_value,
                     room, device_category,
                     hvac_mode, hvac_action, target_temperature, current_temperature, fan_mode,
+                    hour_sin, hour_cos, day_sin, day_cos,
+                    state_delta, state_derivative, time_since_last_change,
+                    occupancy_score, occupancy_confidence,
                     export_timestamp
                   FROM `{temp_table_ref.project}.{temp_table_ref.dataset_id}.{temp_table_ref.table_id}`
                   QUALIFY ROW_NUMBER() OVER (PARTITION BY entity_id, last_changed ORDER BY last_updated DESC) = 1
@@ -1687,7 +1837,16 @@ class BigQueryExportService:
                     hvac_action = source.hvac_action,
                     target_temperature = source.target_temperature,
                     current_temperature = source.current_temperature,
-                    fan_mode = source.fan_mode
+                    fan_mode = source.fan_mode,
+                    hour_sin = source.hour_sin,
+                    hour_cos = source.hour_cos,
+                    day_sin = source.day_sin,
+                    day_cos = source.day_cos,
+                    state_delta = source.state_delta,
+                    state_derivative = source.state_derivative,
+                    time_since_last_change = source.time_since_last_change,
+                    occupancy_score = source.occupancy_score,
+                    occupancy_confidence = source.occupancy_confidence
                 WHEN NOT MATCHED THEN
                   INSERT (
                     record_id, timestamp, record_type,
@@ -1700,6 +1859,9 @@ class BigQueryExportService:
                     state_numeric, temperature_value, humidity_value, power_value, energy_value,
                     room, device_category,
                     hvac_mode, hvac_action, target_temperature, current_temperature, fan_mode,
+                    hour_sin, hour_cos, day_sin, day_cos,
+                    state_delta, state_derivative, time_since_last_change,
+                    occupancy_score, occupancy_confidence,
                     export_timestamp
                   )
                   VALUES (
@@ -1718,6 +1880,9 @@ class BigQueryExportService:
                     source.room, source.device_category,
                     source.hvac_mode, source.hvac_action, source.target_temperature,
                     source.current_temperature, source.fan_mode,
+                    source.hour_sin, source.hour_cos, source.day_sin, source.day_cos,
+                    source.state_delta, source.state_derivative, source.time_since_last_change,
+                    source.occupancy_score, source.occupancy_confidence,
                     source.export_timestamp
                   )
                 """
@@ -1808,6 +1973,9 @@ class BigQueryExportService:
                     state_numeric, temperature_value, humidity_value, power_value, energy_value,
                     room, device_category,
                     hvac_mode, hvac_action, target_temperature, current_temperature, fan_mode,
+                    hour_sin, hour_cos, day_sin, day_cos,
+                    state_delta, state_derivative, time_since_last_change,
+                    occupancy_score, occupancy_confidence,
                     export_timestamp
                   FROM `{temp_table_ref.project}.{temp_table_ref.dataset_id}.{temp_table_ref.table_id}`
                   QUALIFY ROW_NUMBER() OVER (PARTITION BY entity_id, last_changed ORDER BY last_updated DESC) = 1
@@ -1842,7 +2010,16 @@ class BigQueryExportService:
                     hvac_action = source.hvac_action,
                     target_temperature = source.target_temperature,
                     current_temperature = source.current_temperature,
-                    fan_mode = source.fan_mode
+                    fan_mode = source.fan_mode,
+                    hour_sin = source.hour_sin,
+                    hour_cos = source.hour_cos,
+                    day_sin = source.day_sin,
+                    day_cos = source.day_cos,
+                    state_delta = source.state_delta,
+                    state_derivative = source.state_derivative,
+                    time_since_last_change = source.time_since_last_change,
+                    occupancy_score = source.occupancy_score,
+                    occupancy_confidence = source.occupancy_confidence
                 WHEN NOT MATCHED THEN
                   INSERT (
                     record_id, timestamp, record_type,
@@ -1855,6 +2032,9 @@ class BigQueryExportService:
                     state_numeric, temperature_value, humidity_value, power_value, energy_value,
                     room, device_category,
                     hvac_mode, hvac_action, target_temperature, current_temperature, fan_mode,
+                    hour_sin, hour_cos, day_sin, day_cos,
+                    state_delta, state_derivative, time_since_last_change,
+                    occupancy_score, occupancy_confidence,
                     export_timestamp
                   )
                   VALUES (
@@ -1873,6 +2053,9 @@ class BigQueryExportService:
                     source.room, source.device_category,
                     source.hvac_mode, source.hvac_action, source.target_temperature,
                     source.current_temperature, source.fan_mode,
+                    source.hour_sin, source.hour_cos, source.day_sin, source.day_cos,
+                    source.state_delta, source.state_derivative, source.time_since_last_change,
+                    source.occupancy_score, source.occupancy_confidence,
                     source.export_timestamp
                   )
                 """
@@ -1917,3 +2100,380 @@ class BigQueryExportService:
             "table_id": self.config.get(CONF_TABLE_ID, DEFAULT_TABLE_ID),
             "connection_status": "connected" if self._client else "disconnected",
         }
+
+    async def async_check_database_retention(self):
+        """Query the recorder database to check data retention."""
+        def _query_database():
+            try:
+                _LOGGER.info("Step 1/4: Getting recorder instance...")
+                recorder = get_instance(self.hass)
+                if not recorder:
+                    _LOGGER.error("Recorder instance not available")
+                    return None
+
+                _LOGGER.info("Step 2/4: Opening database session...")
+                # Get database session
+                with recorder.get_session() as session:
+                    # Estimate record count using table stats (fast)
+                    count_query = text("""
+                        SELECT TABLE_ROWS
+                        FROM information_schema.tables
+                        WHERE table_schema = DATABASE()
+                        AND table_name = 'states'
+                    """)
+                    count_result = session.execute(count_query).fetchone()
+                    estimated_records = count_result[0] if count_result else 0
+
+                    _LOGGER.info(f"Estimated records in states table: {estimated_records}")
+
+                    if estimated_records == 0:
+                        _LOGGER.warning("States table appears to be empty")
+                        return None
+
+                    # Fast query - get date range
+                    # Note: HA uses last_updated_ts (timestamp) in newer versions
+                    query = text("""
+                        SELECT
+                            MIN(last_updated_ts) as oldest_ts,
+                            MAX(last_updated_ts) as newest_ts
+                        FROM states
+                        WHERE last_updated_ts IS NOT NULL
+                        LIMIT 1
+                    """)
+
+                    result = session.execute(query).fetchone()
+                    _LOGGER.info(f"Timestamp query result: {result}")
+
+                    if result and result[0] is not None and result[1] is not None:
+                        # Convert timestamps to dates
+                        from datetime import datetime
+                        oldest_ts = result[0]
+                        newest_ts = result[1]
+
+                        oldest_date = datetime.fromtimestamp(oldest_ts).date()
+                        newest_date = datetime.fromtimestamp(newest_ts).date()
+                        days_of_data = (newest_date - oldest_date).days
+
+                        _LOGGER.info(f"Converted dates: {oldest_date} to {newest_date} ({days_of_data} days)")
+
+                        # Return tuple with estimated count
+                        return (oldest_date, newest_date, days_of_data, estimated_records)
+                    else:
+                        _LOGGER.error("Query returned NULL timestamps - trying datetime column")
+                        # Fallback to datetime column
+                        fallback_query = text("""
+                            SELECT
+                                DATE(MIN(last_updated)) as oldest_date,
+                                DATE(MAX(last_updated)) as newest_date,
+                                DATEDIFF(MAX(last_updated), MIN(last_updated)) as days_of_data
+                            FROM states
+                            WHERE last_updated IS NOT NULL
+                            LIMIT 1
+                        """)
+                        fallback_result = session.execute(fallback_query).fetchone()
+                        _LOGGER.info(f"Fallback query result: {fallback_result}")
+
+                        if fallback_result and fallback_result[0] is not None:
+                            return (fallback_result[0], fallback_result[1], fallback_result[2], estimated_records)
+                        else:
+                            _LOGGER.error("Both timestamp and datetime queries failed")
+                            return None
+
+            except Exception as err:
+                _LOGGER.error("Error querying database: %s", err, exc_info=True)
+                return None
+
+        return await self.hass.async_add_executor_job(_query_database)
+
+    async def async_check_statistics_retention(self):
+        """Query the statistics table to check long-term stats retention."""
+        def _query_statistics():
+            try:
+                _LOGGER.info("Checking statistics table retention...")
+                recorder = get_instance(self.hass)
+                if not recorder:
+                    _LOGGER.error("Recorder instance not available")
+                    return None
+
+                with recorder.get_session() as session:
+                    # Check statistics table
+                    stats_query = text("""
+                        SELECT
+                            MIN(start_ts) as oldest_ts,
+                            MAX(start_ts) as newest_ts,
+                            COUNT(*) as total_records
+                        FROM statistics
+                        WHERE start_ts IS NOT NULL
+                    """)
+
+                    result = session.execute(stats_query).fetchone()
+
+                    if result and result[0] is not None:
+                        from datetime import datetime
+                        oldest_ts = result[0]
+                        newest_ts = result[1]
+                        total_records = result[2]
+
+                        oldest_date = datetime.fromtimestamp(oldest_ts).date()
+                        newest_date = datetime.fromtimestamp(newest_ts).date()
+                        days_of_data = (newest_date - oldest_date).days
+
+                        _LOGGER.info(f"Statistics table: {oldest_date} to {newest_date} ({days_of_data} days, {total_records:,} records)")
+
+                        return (oldest_date, newest_date, days_of_data, total_records)
+                    else:
+                        _LOGGER.warning("Statistics table is empty or has no valid timestamps")
+                        return None
+
+            except Exception as err:
+                _LOGGER.error("Error querying statistics table: %s", err, exc_info=True)
+                return None
+
+        return await self.hass.async_add_executor_job(_query_statistics)
+
+    async def async_analyze_export_status(self):
+        """Analyze what's been exported vs what's available in local database.
+
+        Returns dict with:
+        - local_oldest, local_newest, local_days, local_records
+        - bigquery_oldest, bigquery_newest, bigquery_days, bigquery_records
+        - gap_before (missing data before BigQuery range)
+        - gap_after (missing data after BigQuery range)
+        - coverage_percent
+        """
+        def _analyze():
+            try:
+                # Query local database
+                recorder = get_instance(self.hass)
+                if not recorder:
+                    return None
+
+                with recorder.get_session() as session:
+                    # Fast query without COUNT(*)
+                    local_query = text("""
+                        SELECT
+                            DATE(MIN(last_updated)) as oldest_date,
+                            DATE(MAX(last_updated)) as newest_date,
+                            DATEDIFF(MAX(last_updated), MIN(last_updated)) as days_of_data
+                        FROM states
+                    """)
+                    local_result = session.execute(local_query).fetchone()
+
+                    # Estimate record count (fast)
+                    count_query = text("""
+                        SELECT TABLE_ROWS
+                        FROM information_schema.tables
+                        WHERE table_schema = DATABASE()
+                        AND table_name = 'states'
+                    """)
+                    count_result = session.execute(count_query).fetchone()
+                    local_records = count_result[0] if count_result else 0
+
+                    # Add count to result tuple
+                    local_result = (local_result[0], local_result[1], local_result[2], local_records)
+
+                # Query BigQuery
+                bq_query = f"""
+                    SELECT
+                        DATE(MIN(last_changed)) as oldest_date,
+                        DATE(MAX(last_changed)) as newest_date,
+                        DATE_DIFF(DATE(MAX(last_changed)), DATE(MIN(last_changed)), DAY) as days_of_data,
+                        COUNT(*) as total_records
+                    FROM `{self.config[CONF_PROJECT_ID]}.{self.config[CONF_DATASET_ID]}.{self.config.get(CONF_TABLE_ID, DEFAULT_TABLE_ID)}`
+                    WHERE record_type = 'state'
+                """
+
+                query_job = self._client.query(bq_query)
+                bq_result = list(query_job.result())[0]
+
+                if not local_result or not bq_result:
+                    return None
+
+                # Calculate gaps
+                local_oldest = local_result[0]
+                local_newest = local_result[1]
+                bq_oldest = bq_result['oldest_date']
+                bq_newest = bq_result['newest_date']
+
+                gap_before_days = (bq_oldest - local_oldest).days if bq_oldest > local_oldest else 0
+                gap_after_days = (local_newest - bq_newest).days if local_newest > bq_newest else 0
+
+                # Calculate coverage
+                local_days = local_result[2]
+                bq_days = bq_result['days_of_data']
+                coverage_percent = (bq_days / local_days * 100) if local_days > 0 else 0
+
+                return {
+                    'local_oldest': str(local_oldest),
+                    'local_newest': str(local_newest),
+                    'local_days': local_result[2],
+                    'local_records': local_result[3],
+                    'bigquery_oldest': str(bq_oldest),
+                    'bigquery_newest': str(bq_newest),
+                    'bigquery_days': bq_days,
+                    'bigquery_records': bq_result['total_records'],
+                    'gap_before_days': gap_before_days,
+                    'gap_after_days': gap_after_days,
+                    'coverage_percent': round(coverage_percent, 1),
+                    'can_backfill': gap_before_days > 0 or gap_after_days > 0
+                }
+
+            except Exception as err:
+                _LOGGER.error("Error analyzing export status: %s", err, exc_info=True)
+                return None
+
+        return await self.hass.async_add_executor_job(_analyze)
+
+    async def async_find_data_gaps(self, min_gap_hours: int = 4):
+        """Find gaps in exported data where local DB has data but BigQuery doesn't.
+
+        Args:
+            min_gap_hours: Minimum gap size in hours to report (default 4)
+
+        Returns list of gaps: [{'start': datetime, 'end': datetime, 'hours': int, 'estimated_records': int}]
+        """
+        def _find_gaps():
+            try:
+                # Get BigQuery date range
+                bq_query = f"""
+                    SELECT
+                        DATE(MIN(last_changed)) as oldest_date,
+                        DATE(MAX(last_changed)) as newest_date
+                    FROM `{self.config[CONF_PROJECT_ID]}.{self.config[CONF_DATASET_ID]}.{self.config.get(CONF_TABLE_ID, DEFAULT_TABLE_ID)}`
+                    WHERE record_type = 'state'
+                """
+                query_job = self._client.query(bq_query)
+                bq_result = list(query_job.result())[0]
+                bq_oldest = bq_result['oldest_date']
+                bq_newest = bq_result['newest_date']
+
+                # Query local database for gaps
+                recorder = get_instance(self.hass)
+                if not recorder:
+                    return None
+
+                with recorder.get_session() as session:
+                    # Find data before BigQuery range
+                    gap_before_query = text("""
+                        SELECT
+                            DATE(MIN(last_updated)) as gap_start,
+                            DATE(MAX(last_updated)) as gap_end,
+                            COUNT(*) as records
+                        FROM states
+                        WHERE DATE(last_updated) < :bq_oldest
+                    """)
+                    gap_before = session.execute(gap_before_query, {'bq_oldest': bq_oldest}).fetchone()
+
+                    # Find data after BigQuery range
+                    gap_after_query = text("""
+                        SELECT
+                            DATE(MIN(last_updated)) as gap_start,
+                            DATE(MAX(last_updated)) as gap_end,
+                            COUNT(*) as records
+                        FROM states
+                        WHERE DATE(last_updated) > :bq_newest
+                    """)
+                    gap_after = session.execute(gap_after_query, {'bq_newest': bq_newest}).fetchone()
+
+                    gaps = []
+
+                    # Gap before BigQuery data
+                    if gap_before and gap_before[2] > 0:
+                        gap_days = (bq_oldest - gap_before[0]).days
+                        if gap_days * 24 >= min_gap_hours:
+                            gaps.append({
+                                'type': 'before',
+                                'start': str(gap_before[0]),
+                                'end': str(gap_before[1]),
+                                'days': gap_days,
+                                'estimated_records': gap_before[2]
+                            })
+
+                    # Gap after BigQuery data
+                    if gap_after and gap_after[2] > 0:
+                        gap_days = (gap_after[1] - bq_newest).days
+                        if gap_days * 24 >= min_gap_hours:
+                            gaps.append({
+                                'type': 'after',
+                                'start': str(gap_after[0]),
+                                'end': str(gap_after[1]),
+                                'days': gap_days,
+                                'estimated_records': gap_after[2]
+                            })
+
+                    return gaps
+
+            except Exception as err:
+                _LOGGER.error("Error finding data gaps: %s", err, exc_info=True)
+                return None
+
+        return await self.hass.async_add_executor_job(_find_gaps)
+
+    async def async_estimate_backfill(self, start_date: str, end_date: str):
+        """Estimate the size and time for a backfill operation.
+
+        Args:
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+
+        Returns dict with estimates
+        """
+        def _estimate():
+            try:
+                recorder = get_instance(self.hass)
+                if not recorder:
+                    return None
+
+                with recorder.get_session() as session:
+                    # Count records in date range
+                    estimate_query = text("""
+                        SELECT
+                            COUNT(*) as total_records,
+                            COUNT(DISTINCT entity_id) as unique_entities,
+                            COUNT(DISTINCT DATE(last_updated)) as days_of_data
+                        FROM states
+                        WHERE DATE(last_updated) >= :start_date
+                          AND DATE(last_updated) <= :end_date
+                    """)
+                    result = session.execute(estimate_query, {
+                        'start_date': start_date,
+                        'end_date': end_date
+                    }).fetchone()
+
+                    if not result:
+                        return None
+
+                    total_records = result[0]
+                    unique_entities = result[1]
+                    days_of_data = result[2]
+
+                    # Estimate processing time (rough: 10K records/minute)
+                    estimated_minutes = (total_records / 10000) * 1.0
+                    estimated_hours = estimated_minutes / 60
+
+                    # Estimate BigQuery storage cost ($0.02/GB, ~1KB per record)
+                    estimated_size_gb = (total_records * 1024) / (1024 ** 3)
+                    estimated_storage_cost = estimated_size_gb * 0.02
+
+                    # Estimate query cost ($5/TB, typically scan 10% of data)
+                    estimated_query_cost_monthly = (estimated_size_gb / 1024) * 5 * 0.1
+
+                    return {
+                        'start_date': start_date,
+                        'end_date': end_date,
+                        'total_records': total_records,
+                        'unique_entities': unique_entities,
+                        'days_of_data': days_of_data,
+                        'estimated_minutes': round(estimated_minutes, 1),
+                        'estimated_hours': round(estimated_hours, 2),
+                        'estimated_size_gb': round(estimated_size_gb, 3),
+                        'estimated_storage_cost': round(estimated_storage_cost, 4),
+                        'estimated_query_cost_monthly': round(estimated_query_cost_monthly, 4),
+                        'recommended_chunk_days': 7 if total_records > 100000 else 30
+                    }
+
+            except Exception as err:
+                _LOGGER.error("Error estimating backfill: %s", err, exc_info=True)
+                return None
+
+        return await self.hass.async_add_executor_job(_estimate)
