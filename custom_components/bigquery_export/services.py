@@ -2295,6 +2295,12 @@ class BigQueryExportService:
                 bq_oldest = bq_result['oldest_date']
                 bq_newest = bq_result['newest_date']
 
+                # Check for None values before comparison
+                if not local_oldest or not local_newest or not bq_oldest or not bq_newest:
+                    _LOGGER.warning("Cannot calculate gaps: Missing date values (local: %s-%s, bq: %s-%s)",
+                                   local_oldest, local_newest, bq_oldest, bq_newest)
+                    return None
+
                 gap_before_days = (bq_oldest - local_oldest).days if bq_oldest > local_oldest else 0
                 gap_after_days = (local_newest - bq_newest).days if local_newest > bq_newest else 0
 
